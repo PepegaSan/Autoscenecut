@@ -16,12 +16,24 @@ root = str(spec_dir)
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs
 
 try:
-    import tkinterdnd2  # noqa: F401 — nur prüfen, dass Build-Python das Paket hat
+    import tkinterdnd2  # noqa: F401
 except ImportError as e:
     raise SystemExit(
-        'tkinterdnd2 fehlt in diesem Python. Gleiche Umgebung wie PyInstaller nutzen:\n'
-        '  pip install tkinterdnd2'
+        'Missing package: tkinterdnd2\n'
+        '  python -m pip install tkinterdnd2\n'
+        '(same Python you use for PyInstaller)'
     ) from e
+
+# Method A + video-player analyze import analyzer lazily — without collect_all, torch etc. stay out of the EXE.
+for _need in ('torch', 'onnxruntime', 'faster_whisper', 'ctranslate2'):
+    try:
+        __import__(_need)
+    except ImportError as e:
+        raise SystemExit(
+            f'Missing package: {_need} (needed for Method A and scene analysis in the EXE)\n'
+            '  python -m pip install -r requirements.txt\n'
+            '(same Python as: python -m PyInstaller ...)'
+        ) from e
 
 datas = [
     (str(spec_dir / 'config_nvidia.example.ini'), '.'),
@@ -40,6 +52,12 @@ hiddenimports = [
 ]
 
 for pkg in ('customtkinter',):
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
+
+for pkg in ('torch', 'onnxruntime', 'faster_whisper', 'ctranslate2'):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

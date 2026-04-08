@@ -12,6 +12,7 @@ import subprocess
 import configparser
 import statistics
 import cv2
+import torch  # noqa: F401 — in der EXE: Methode A / Scene-Analyse laden analyzer nur lazy; sonst fehlt torch im Bundle
 from PIL import Image
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
@@ -227,9 +228,13 @@ class NvidiaGUI(DnD_CTk):
 
         self.title('Autocut NVIDIA Control Center')
         self.geometry('820x1200')
+        self.minsize(520, 420)
 
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.pack(fill='both', expand=True, padx=20, pady=15)
+        self._scroll_body = ctk.CTkScrollableFrame(self, fg_color='transparent')
+        self._scroll_body.pack(fill='both', expand=True, padx=12, pady=12)
+
+        self.tabs = ctk.CTkTabview(self._scroll_body)
+        self.tabs.pack(fill='x', expand=False, padx=8, pady=(0, 8))
         self.tab_source = self.tabs.add('1. Source')
         self.tab_thresholds = self.tabs.add('2. Thresholds')
         self.tab_export = self.tabs.add('3. Categories & Export')
@@ -238,24 +243,24 @@ class NvidiaGUI(DnD_CTk):
         self.build_thresholds_tab()
         self.build_export_tab()
 
-        self.frame_progress = ctk.CTkFrame(self, fg_color='transparent')
-        self.frame_progress.pack(fill='x', padx=20, pady=(0, 5))
+        self.frame_progress = ctk.CTkFrame(self._scroll_body, fg_color='transparent')
+        self.frame_progress.pack(fill='x', padx=8, pady=(0, 5))
         self.lbl_status = ctk.CTkLabel(self.frame_progress, text='Ready', font=('Arial', 12))
         self.lbl_status.pack(anchor='w')
         self.progress = ctk.CTkProgressBar(self.frame_progress)
         self.progress.pack(fill='x', pady=6)
         self.progress.set(0)
 
-        self.log_frame = ctk.CTkFrame(self)
-        self.log_frame.pack(fill='both', expand=False, padx=20, pady=(0, 8))
+        self.log_frame = ctk.CTkFrame(self._scroll_body)
+        self.log_frame.pack(fill='x', expand=False, padx=8, pady=(0, 8))
         ctk.CTkLabel(self.log_frame, text='Live Segment Log', font=('Arial', 12, 'bold')).pack(anchor='w', padx=10, pady=(8, 4))
         self.txt_log = ctk.CTkTextbox(self.log_frame, height=220)
-        self.txt_log.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        self.txt_log.pack(fill='x', expand=False, padx=10, pady=(0, 10))
         self.txt_log.insert('end', 'Segment details will appear here during analysis.\n')
         self.txt_log.configure(state='disabled')
 
-        action_frame = ctk.CTkFrame(self, fg_color='transparent')
-        action_frame.pack(fill='x', padx=20, pady=(0, 20))
+        action_frame = ctk.CTkFrame(self._scroll_body, fg_color='transparent')
+        action_frame.pack(fill='x', padx=8, pady=(0, 16))
         self.btn_run = ctk.CTkButton(action_frame, text='▶ START AUTOCUT', height=42, fg_color='#28a745', hover_color='#218838', command=self.run_process)
         self.btn_run.pack(side='left', fill='x', expand=True, padx=(0, 5))
         self.btn_pause = ctk.CTkButton(
@@ -408,8 +413,40 @@ class NvidiaGUI(DnD_CTk):
         # Export Engine
         self.opt_mode = ctk.CTkOptionMenu(frame, values=['FFmpeg: H.265 (Hardware NVENC)', 'DaVinci: Export Timeline (XML)', 'DaVinci: Export Edit Decision List (EDL)', 'DaVinci: AUTO-RENDER'])
         self.opt_mode.set(self.g('Settings', 'export_engine', 'FFmpeg: H.265 (Hardware NVENC)'))
-        self.opt_mode.pack(fill='x', padx=14, pady=15)
-        
+        self.opt_mode.pack(fill='x', padx=14, pady=(15, 6))
+
+        ctk.CTkLabel(frame, text='Video bitrate (FFmpeg + DaVinci AUTO-RENDER):', font=('Arial', 12, 'bold')).pack(anchor='w', padx=14)
+        self.opt_bitrate_mode = ctk.CTkOptionMenu(
+            frame,
+            values=['default (NVENC preset / no target kbps)', 'match_source (ffprobe → target kbps)', 'manual (fixed kb/s)'],
+        )
+        _bm = (self.g('Settings', 'export_bitrate_mode', 'default') or 'default').strip().lower()
+        if _bm in ('match_source', 'match', 'source'):
+            self.opt_bitrate_mode.set('match_source (ffprobe → target kbps)')
+        elif _bm in ('manual', 'fixed'):
+            self.opt_bitrate_mode.set('manual (fixed kb/s)')
+        else:
+            self.opt_bitrate_mode.set('default (NVENC preset / no target kbps)')
+        self.opt_bitrate_mode.pack(fill='x', padx=14, pady=(0, 4))
+        row_man_br = ctk.CTkFrame(frame, fg_color='transparent')
+        row_man_br.pack(fill='x', padx=14, pady=(0, 10))
+        ctk.CTkLabel(row_man_br, text='Manual kb/s', width=100, anchor='w').pack(side='left')
+        self.ed_manual_kbps = ctk.CTkEntry(row_man_br, width=100)
+        self.ed_manual_kbps.insert(0, self.g('Settings', 'export_manual_video_kbps', '12000'))
+        self.ed_manual_kbps.pack(side='left', padx=(8, 0))
+        ctk.CTkLabel(
+            frame,
+            text=(
+                'match_source: reads source video bitrate via ffprobe (approximate). '
+                'DaVinci: sets API DataRate if your AutoCutPreset uses a restricted bitrate. '
+                'Not byte-identical to source — different encoder/GOP still changes the file.'
+            ),
+            text_color='gray',
+            font=('Arial', 10),
+            justify='left',
+            wraplength=720,
+        ).pack(anchor='w', padx=14, pady=(0, 12))
+
         # 1. DaVinci API
         ctk.CTkLabel(frame, text='DaVinci Resolve API Path (optional):', font=('Arial', 12, 'bold')).pack(anchor='w', padx=14)
         self.ed_path = ctk.CTkEntry(frame)
@@ -418,7 +455,19 @@ class NvidiaGUI(DnD_CTk):
         
         # 2. Python Path
         ctk.CTkLabel(frame, text='Custom Python Worker Path:', font=('Arial', 12, 'bold')).pack(anchor='w', padx=14)
-        ctk.CTkLabel(frame, text="Info: Only needed if the standalone .exe fails to auto-detect DaVinci's Python.", text_color='gray', font=('Arial', 11), justify='left').pack(anchor='w', padx=14)
+        ctk.CTkLabel(
+            frame,
+            text=(
+                'Required for DaVinci AUTO-RENDER when using the standalone .exe (the .exe is not Python). '
+                'Use Resolve’s f4python, e.g. …\\DaVinci Resolve\\f4python\\3.12\\bin\\python.exe, or any Python 3.12 '
+                'that can import DaVinciResolveScript with your API path below. On Windows, 3.11/3.9 often fail to '
+                'drive Resolve even when import succeeds — prefer 3.12. Optional when running from source.'
+            ),
+            text_color='gray',
+            font=('Arial', 11),
+            justify='left',
+            wraplength=720,
+        ).pack(anchor='w', padx=14)
         self.ed_py_path = ctk.CTkEntry(frame)
         self.ed_py_path.insert(0, self.g('Settings', 'davinci_python_path', ''))
         self.ed_py_path.pack(fill='x', padx=14, pady=(0, 10))
@@ -438,6 +487,18 @@ class NvidiaGUI(DnD_CTk):
         # --- DEIN FEHLENDER EXPORT BUTTON ---
         self.btn_retry_export = ctk.CTkButton(frame, text='🔁 Retry Export (from Checkpoint)', height=38, fg_color='#d35400', hover_color='#a04000', command=self.retry_export_click)
         self.btn_retry_export.pack(fill='x', padx=14, pady=(15, 5))
+        ctk.CTkLabel(
+            frame,
+            text=(
+                'After a full run: change the category switches above (e.g. turn off Keep Vocal). Settings are saved when you click '
+                'Retry Export. The timeline is rebuilt from the checkpoint with your new choices — no re-analysis. '
+                'Older checkpoints without segment_results: export uses the saved segment list only (same as before).'
+            ),
+            text_color='gray',
+            font=('Arial', 11),
+            justify='left',
+            wraplength=720,
+        ).pack(anchor='w', padx=14, pady=(0, 8))
 
     def restore_stable_defaults(self):
         # Penalty Faktoren
@@ -506,6 +567,14 @@ class NvidiaGUI(DnD_CTk):
         
         if not self.cfg.has_section('Settings'): self.cfg.add_section('Settings')
         self.cfg['Settings']['export_engine'] = self.opt_mode.get()
+        _lbl = self.opt_bitrate_mode.get()
+        if 'match_source' in _lbl:
+            self.cfg['Settings']['export_bitrate_mode'] = 'match_source'
+        elif 'manual' in _lbl:
+            self.cfg['Settings']['export_bitrate_mode'] = 'manual'
+        else:
+            self.cfg['Settings']['export_bitrate_mode'] = 'default'
+        self.cfg['Settings']['export_manual_video_kbps'] = self.ed_manual_kbps.get().strip()
         self.cfg['Settings']['resolve_api_path'] = self.ed_path.get()
         self.cfg['Settings']['davinci_python_path'] = self.ed_py_path.get()
         self.cfg['Settings']['output_path'] = self.ed_out_dir.get()
@@ -829,7 +898,14 @@ class NvidiaGUI(DnD_CTk):
                 ):
                     self.after(0, lambda txt=line: self.lbl_status.configure(text=txt[:110], text_color='white'))
                     self.after(0, lambda txt=line: self.append_log(txt))
-                elif 'EXPORT_FAILED' in line or 'RETRY_EXPORT:' in line or 'NO_CHECKPOINT' in line or 'VIDEO_MISSING' in line or 'CHECKPOINT_EMPTY' in line:
+                elif (
+                    'EXPORT_FAILED' in line
+                    or 'RETRY_EXPORT:' in line
+                    or 'NO_CHECKPOINT' in line
+                    or 'VIDEO_MISSING' in line
+                    or 'CHECKPOINT_EMPTY' in line
+                    or 'REEXPORT_NO_SEGMENTS' in line
+                ):
                     self.after(0, lambda txt=line: self.append_log(txt))
                 elif 'successfully finished' in line.lower():
                     self.after(0, lambda txt=line: self.append_log(txt))
@@ -863,6 +939,11 @@ class NvidiaGUI(DnD_CTk):
             self.lbl_status.configure(text='Retry: video from checkpoint not found', text_color='red')
         elif returncode == 5:
             self.lbl_status.configure(text='Retry: checkpoint has no segments', text_color='red')
+        elif returncode == 6:
+            self.lbl_status.configure(
+                text='Retry: no segments left with current category switches — adjust and try again',
+                text_color='orange',
+            )
         elif returncode not in (0, None):
             self.lbl_status.configure(text=f'Process exited with code {returncode}', text_color='red')
         else:
