@@ -50,11 +50,10 @@ Output: `dist/ScenecutNVIDIA.exe`. Distribute that file; on first run it creates
 - `yamnet.onnx` and `yamnet_class_map.csv` are included for audio-classification features.
 - `output/` is runtime data and excluded from version control.
 
-
-## Publish Checklist
-- Review `LICENSE` author/year
-- Create GitHub repo and upload this folder content
-- Add screenshots or GIFs to README (optional, recommended)
+## Screenshots
+![Tab 1](images/Tab1.png)
+![Tab 2](images/Tab2.png)
+![Tab 3](images/Tab3.png)
 
 ## Credit
 Thanks OpenAi for the Whisper-Modell
