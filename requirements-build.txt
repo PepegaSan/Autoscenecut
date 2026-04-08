@@ -1,0 +1,3 @@
+# Optional: only needed to build ScenecutNVIDIA.exe (see README)
+pyinstaller>=6.0
+pyinstaller-hooks-contrib>=2024.0
