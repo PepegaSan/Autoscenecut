@@ -60,10 +60,30 @@ def _davinci_resolve_script_import_ok(py_exe, api_path):
         return False
 
 
+def _interpreter_major_minor(py_exe):
+    try:
+        r = subprocess.run(
+            [py_exe, '-c', 'import sys; print(sys.version_info[0], sys.version_info[1])'],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            return None
+        parts = (r.stdout or '').strip().split()
+        if len(parts) < 2:
+            return None
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return None
+
+
 def pick_davinci_worker_python(cfg):
     """
-    Resolve's f4python / DaVinciResolveScript.pyd matches a specific CPython ABI (often 3.12 on Windows).
-    Conda 3.11 may fail to import; we probe interpreters without requiring a manual path (exe-friendly).
+    Resolve's DaVinciResolveScript.pyd matches one CPython ABI per Resolve version. On current Windows
+    Resolve builds this is almost always Python 3.12. Using 3.9/3.11 can pass a naive import test but
+    then fail to talk to Resolve correctly — set davinci_python_path to 3.12 (e.g. f4python\\3.12).
     """
     api_path = cfg.get('Settings', 'resolve_api_path', fallback='').strip()
     override = cfg.get('Settings', 'davinci_python_path', fallback='').strip()
@@ -83,6 +103,18 @@ def pick_davinci_worker_python(cfg):
 
     candidates = []
     if sys.platform == 'win32':
+        # Resolve ships a CPython build under f4python — often works when store python.org does not.
+        for base in (
+            os.environ.get('ProgramFiles', r'C:\Program Files'),
+            os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+        ):
+            for tail in (
+                os.path.join('Blackmagic Design', 'DaVinci Resolve', 'f4python', '3.12', 'bin', 'python.exe'),
+                os.path.join('Blackmagic Design', 'DaVinci Resolve', 'f4python', '3.12', 'python.exe'),
+            ):
+                p = os.path.join(base, tail)
+                if os.path.isfile(p):
+                    candidates.append(p)
         for ver in ('3.12', '3.11', '3.10'):
             try:
                 r = subprocess.run(
@@ -122,13 +154,62 @@ def pick_davinci_worker_python(cfg):
         candidates.append(sys.executable)
 
     seen = set()
+
+    def try_candidates(version_filter_312):
+        """On Windows, prefer 3.12 first — other versions often misbehave with Resolve despite import OK."""
+        for exe in candidates:
+            if exe in seen:
+                continue
+            if sys.platform == 'win32' and version_filter_312:
+                ver = _interpreter_major_minor(exe)
+                if ver != (3, 12):
+                    continue
+            seen.add(exe)
+            if not _davinci_resolve_script_import_ok(exe, api_path):
+                continue
+            if sys.platform == 'win32' and version_filter_312:
+                print(f'INFO: DaVinci-Worker-Python (auto, Windows bevorzugt 3.12): {exe}', flush=True)
+            else:
+                print(f'INFO: DaVinci-Worker-Python (auto): {exe}', flush=True)
+            return exe
+        return None
+
+    if sys.platform == 'win32':
+        picked = try_candidates(version_filter_312=True)
+        if picked:
+            return picked
+        seen.clear()
+        print(
+            'WARNUNG: Kein Python 3.12 mit importierbarem DaVinciResolveScript — Fallback alle Versionen.',
+            flush=True,
+        )
+
     for exe in candidates:
         if exe in seen:
             continue
         seen.add(exe)
         if _davinci_resolve_script_import_ok(exe, api_path):
-            print(f'INFO: DaVinci-Worker-Python (auto): {exe}', flush=True)
+            if sys.platform == 'win32':
+                print(
+                    f'WARNUNG: DaVinci-Worker nutzt {exe} (nicht 3.12). Wenn Resolve nicht reagiert, '
+                    'davinci_python_path auf Python 3.12 setzen (z. B. f4python\\3.12\\bin\\python.exe).',
+                    flush=True,
+                )
+            else:
+                print(f'INFO: DaVinci-Worker-Python (auto): {exe}', flush=True)
             return exe
+
+    if getattr(sys, 'frozen', False):
+        print(
+            'EXPORT_FAILED: Kein python.exe gefunden, das DaVinciResolveScript laden kann.\n'
+            'Die Scenecut-EXE ist kein Python — sie kann den DaVinci-Worker nicht starten.\n'
+            'Lösung: In der GUI (Export-Tab) „Custom Python Worker Path“ setzen — typisch z.B.\n'
+            '  …\\DaVinci Resolve\\f4python\\3.12\\bin\\python.exe\n'
+            'oder ein Python 3.12, das mit resolve_api_path (Modules) import DaVinciResolveScript schafft.\n'
+            'Alternativ Umgebungsvariable DAVINCI_SCRIPT_PYTHON auf diese python.exe.',
+            flush=True,
+        )
+        return None
 
     fallback = sys.executable if os.path.isfile(sys.executable) else 'python'
     print(
@@ -443,18 +524,139 @@ def decide_category(metrics, cfg):
 
 
 def should_keep(flags, cfg):
-    final = flags['final_category']
+    return should_keep_category(flags['final_category'], cfg)
+
+
+def should_keep_category(final_category, cfg):
+    """Reusable when re-filtering from checkpoint (only final_category string per segment)."""
     return any([
-        cfg.getboolean('Categories', 'keep_action', fallback=False) and final == 'action',
-        cfg.getboolean('Categories', 'keep_dialogue', fallback=False) and final == 'dialogue',
-        cfg.getboolean('Categories', 'keep_vocal', fallback=False) and final == 'vocal',
-        cfg.getboolean('Categories', 'keep_music', fallback=False) and final == 'music',
-        cfg.getboolean('Categories', 'keep_silence', fallback=False) and final == 'silence',
+        cfg.getboolean('Categories', 'keep_action', fallback=False) and final_category == 'action',
+        cfg.getboolean('Categories', 'keep_dialogue', fallback=False) and final_category == 'dialogue',
+        cfg.getboolean('Categories', 'keep_vocal', fallback=False) and final_category == 'vocal',
+        cfg.getboolean('Categories', 'keep_music', fallback=False) and final_category == 'music',
+        cfg.getboolean('Categories', 'keep_silence', fallback=False) and final_category == 'silence',
     ])
 
 
-def write_autocut_checkpoint(vid, merged, fps, step, out_dir, cfg_snapshot):
-    """After analysis, before export — enables retry / manual FFmpeg without re-running Whisper."""
+def merge_adjacent_keep_segments(keep):
+    if not keep:
+        return []
+    merged = [keep[0]]
+    for cur in keep[1:]:
+        if cur[0] <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], cur[1]))
+        else:
+            merged.append(cur)
+    return merged
+
+
+def probe_video_bitrate_kbps(video_path):
+    """
+    Schätzt die Video-Stream-Bitrate in kb/s (kilobits/s). ffprobe liefert bit_rate i. d. R. in bit/s.
+    Kein exakter VBR-„Durchschnitt“, aber nah an der Quell-Metadaten-Bitrate; sonst grobe Schätzung.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return None
+    try:
+        r = subprocess.run(
+            [
+                'ffprobe',
+                '-v',
+                'error',
+                '-select_streams',
+                'v:0',
+                '-show_entries',
+                'stream=bit_rate,avg_bitrate',
+                '-show_entries',
+                'format=bit_rate,duration,size',
+                '-of',
+                'json',
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            return None
+        j = json.loads(r.stdout or '{}')
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+    def _bps_to_kbps(bps_str):
+        if not bps_str:
+            return None
+        try:
+            b = int(bps_str)
+            if b <= 0:
+                return None
+            return max(1, b // 1000)
+        except (TypeError, ValueError):
+            return None
+
+    streams = j.get('streams') or []
+    if streams:
+        st0 = streams[0]
+        for key in ('bit_rate', 'avg_bitrate'):
+            kb = _bps_to_kbps(st0.get(key))
+            if kb and 200 <= kb <= 800000:
+                return kb
+
+    fmt = j.get('format') or {}
+    fb = _bps_to_kbps(fmt.get('bit_rate'))
+    if fb and 200 <= fb <= 800000:
+        return max(200, fb - 256)
+
+    try:
+        dur = float(fmt.get('duration') or 0)
+        size = int(fmt.get('size') or 0)
+    except (TypeError, ValueError):
+        dur, size = 0.0, 0
+    if dur > 0.5 and size > 100000:
+        total_kbps = int((size * 8) / dur / 1000)
+        guess = max(200, total_kbps - 256)
+        if guess <= 800000:
+            return guess
+    return None
+
+
+def export_target_video_kbps(cfg, source_video):
+    """
+    export_bitrate_mode: default | match_source | manual
+    default: FFmpeg nutzt NVENC nur mit Preset / AMD-Build nutzt CRF — kein Ziel-kbps.
+    """
+    mode = (cfg.get('Settings', 'export_bitrate_mode', fallback='default') or 'default').strip().lower()
+    if mode in ('match_source', 'match', 'source'):
+        kbps = probe_video_bitrate_kbps(source_video)
+        if kbps:
+            print(f'INFO: Video-Zielbitrate ~{kbps} kb/s (Quelle/ffprobe).', flush=True)
+            return kbps
+        print(
+            'WARNUNG: export_bitrate_mode=match_source, Bitrate nicht ermittelbar — Preset/Standard-Encoding.',
+            flush=True,
+        )
+        return None
+    if mode in ('manual', 'fixed'):
+        raw = (cfg.get('Settings', 'export_manual_video_kbps', fallback='') or '').strip()
+        try:
+            v = int(raw)
+            if v < 200:
+                print('WARNUNG: export_manual_video_kbps zu niedrig (<200), ignoriert.', flush=True)
+                return None
+            return min(800000, v)
+        except ValueError:
+            print('WARNUNG: export_manual_video_kbps ist keine Zahl.', flush=True)
+            return None
+    return None
+
+
+def write_autocut_checkpoint(vid, merged, fps, step, out_dir, cfg_snapshot, segment_results=None):
+    """After analysis, before export — enables retry / manual FFmpeg without re-running Whisper.
+
+    segment_results: list of {start, end, final_category} for all analyzed segments — used on retry
+    to rebuild the timeline from current category switches without re-running analysis.
+    """
     out = Path('output')
     out.mkdir(parents=True, exist_ok=True)
     ck_path = out / 'last_autocut_checkpoint.json'
@@ -467,13 +669,21 @@ def write_autocut_checkpoint(vid, merged, fps, step, out_dir, cfg_snapshot):
         'interval_seconds': int(step),
         **cfg_snapshot,
     }
+    if segment_results is not None:
+        payload['segment_results'] = segment_results
     with open(ck_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f'CHECKPOINT:{ck_path.resolve()}', flush=True)
     return ck_path
 
 
-def export_ffmpeg(vid, segs, preset, out_dir):
+def export_ffmpeg(vid, segs, preset, out_dir, cfg):
+    target_kbps = export_target_video_kbps(cfg, vid)
+    if target_kbps:
+        br = f' -rc:v vbr -b:v {target_kbps}k -maxrate {int(target_kbps * 1.25)}k -bufsize {int(target_kbps * 2)}k'
+        print(f'INFO: NVENC mit Ziel-Bitrate (VBR): {target_kbps} kb/s.', flush=True)
+    else:
+        br = ''
     total = len(segs)
     os.makedirs(out_dir, exist_ok=True)
     list_path = os.path.join(out_dir, 'concat_list.txt')
@@ -484,7 +694,7 @@ def export_ffmpeg(vid, segs, preset, out_dir):
         for idx, (s, e) in enumerate(segs):
             wait_if_paused()
             temp_out = os.path.join(out_dir, f'temp_{idx}.mp4')
-            cmd = f'ffmpeg -y -ss {s} -to {e} -i "{vid}" -c:v hevc_nvenc -preset {preset} -c:a aac "{temp_out}"'
+            cmd = f'ffmpeg -y -ss {s} -to {e} -i "{vid}" -c:v hevc_nvenc -preset {preset}{br} -c:a aac "{temp_out}"'
             r = subprocess.run(
                 cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW
             )
@@ -535,12 +745,27 @@ def export_ffmpeg(vid, segs, preset, out_dir):
 
 def render_davinci(vid, segs, api_path, fps, out_dir, cfg, resolve_py=None):
     py_exe = resolve_py if resolve_py else pick_davinci_worker_python(cfg)
+    if not py_exe or not os.path.isfile(py_exe):
+        print('EXPORT_FAILED: DaVinci AUTO-RENDER abgebrochen (kein Worker-Python).', flush=True)
+        return False
+    if getattr(sys, 'frozen', False):
+        try:
+            if os.path.normcase(os.path.abspath(py_exe)) == os.path.normcase(os.path.abspath(sys.executable)):
+                print(
+                    'EXPORT_FAILED: Worker-Python darf nicht die Scenecut-EXE sein — bitte davinci_python_path setzen.',
+                    flush=True,
+                )
+                return False
+        except OSError:
+            pass
     abs_vid = os.path.abspath(vid).replace('\\', '/')
     safe_out_dir = os.path.abspath(out_dir).replace('\\', '/')
     safe_api_path = (api_path or '').replace('\\', '/')
 
     base_name = os.path.splitext(os.path.basename(abs_vid))[0]
     custom_name = f"{base_name}_scenecut_export"
+
+    rate_kbps = export_target_video_kbps(cfg, vid)
 
     data = {
         "vid": abs_vid,
@@ -549,6 +774,7 @@ def render_davinci(vid, segs, api_path, fps, out_dir, cfg, resolve_py=None):
         "fps": fps,
         "out_dir": safe_out_dir,
         "custom_name": custom_name,
+        "resolve_data_rate_kbps": rate_kbps,
     }
 
     data_file = os.path.abspath("davinci_job.json").replace('\\', '/')
@@ -678,6 +904,14 @@ try:
         render_settings['ResolutionWidth'] = width
         render_settings['ResolutionHeight'] = height
 
+    dr = data.get('resolve_data_rate_kbps')
+    if dr is not None:
+        try:
+            render_settings['DataRate'] = str(int(dr))
+            print('INFO: Deliver DataRate (kb/s) =', int(dr), '(API; Preset muss „Restrict“/Bitrate erlauben)', flush=True)
+        except (TypeError, ValueError):
+            pass
+
     proj.SetRenderSettings(render_settings)
     time.sleep(0.25)
 
@@ -751,7 +985,7 @@ def run_export_only(vid, merged, fps, out_dir, cfg, resolve_py=None):
         return export_edl_cmx(vid, merged, fps, out_dir)
     if 'XML' in engine:
         return export_xml_xmeml(vid, merged, fps, out_dir)
-    return export_ffmpeg(vid, merged, preset, out_dir)
+    return export_ffmpeg(vid, merged, preset, out_dir, cfg)
 
 
 def retry_export_from_checkpoint():
@@ -769,11 +1003,38 @@ def retry_export_from_checkpoint():
     if not vid or not os.path.isfile(vid):
         print(f'VIDEO_MISSING: Datei nicht gefunden: {vid}', flush=True)
         sys.exit(4)
-    raw_segs = ck.get('merged_segments') or []
-    merged = [(float(a), float(b)) for a, b in raw_segs]
-    if not merged:
-        print('CHECKPOINT_EMPTY: merged_segments ist leer.', flush=True)
-        sys.exit(5)
+
+    seg_res = ck.get('segment_results')
+    if seg_res:
+        keep = []
+        for s in seg_res:
+            cat = (s.get('final_category') or 'dialogue').strip()
+            try:
+                t0, t1 = float(s['start']), float(s['end'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if should_keep_category(cat, cfg):
+                keep.append((t0, t1))
+        keep.sort(key=lambda x: x[0])
+        merged = merge_adjacent_keep_segments(keep)
+        if not merged:
+            print(
+                'REEXPORT_NO_SEGMENTS: Mit den aktuellen Kategorie-Schaltern (INI) bleibt kein Segment übrig.',
+                flush=True,
+            )
+            sys.exit(6)
+        print(
+            f'RETRY_EXPORT: category_refilter=on source_segments={len(seg_res)} merged_after_filter={len(merged)}',
+            flush=True,
+        )
+    else:
+        raw_segs = ck.get('merged_segments') or []
+        merged = [(float(a), float(b)) for a, b in raw_segs]
+        if not merged:
+            print('CHECKPOINT_EMPTY: merged_segments ist leer.', flush=True)
+            sys.exit(5)
+        print('RETRY_EXPORT: category_refilter=off (alter Checkpoint ohne segment_results)', flush=True)
+
     fps = float(ck.get('fps') or 30.0)
 
     out_cfg = cfg.get('Settings', 'output_path', fallback='').strip()
@@ -821,15 +1082,20 @@ def main():
     total_steps = max(1, len(range(0, dur, step)))
     csv_rows = []
     keep = []
-    
+    segment_results = []
+
     for idx, t in enumerate(range(0, dur, step), start=1):
         wait_if_paused()
         metrics = analyze_segment(vid, t, step)
         flags = decide_category(metrics, cfg)
         keep_flag = should_keep(flags, cfg)
-        
+        seg_end = min(t + step, dur)
+        segment_results.append(
+            {'start': float(t), 'end': float(seg_end), 'final_category': flags['final_category']}
+        )
+
         if keep_flag:
-            keep.append((t, min(t + step, dur)))
+            keep.append((t, seg_end))
 
         csv_rows.append({
             'segment_idx': idx,
@@ -872,10 +1138,7 @@ def main():
         print('PROGRESS:100', flush=True)
         return
 
-    merged = [keep[0]]
-    for cur in keep[1:]:
-        if cur[0] <= merged[-1][1]: merged[-1] = (merged[-1][0], max(merged[-1][1], cur[1]))
-        else: merged.append(cur)
+    merged = merge_adjacent_keep_segments(keep)
 
     print('Analysis complete. Starting Export...', flush=True)
     resolve_py = None
@@ -885,10 +1148,12 @@ def main():
     cfg_snapshot = {
         'export_engine': engine,
         'ffmpeg_nvenc_preset': cfg.get('Settings', 'ffmpeg_nvenc_preset', fallback='p4'),
+        'export_bitrate_mode': cfg.get('Settings', 'export_bitrate_mode', fallback='default'),
+        'export_manual_video_kbps': cfg.get('Settings', 'export_manual_video_kbps', fallback=''),
         'resolve_api_path': api_path,
         'davinci_python_path': snap_py,
     }
-    write_autocut_checkpoint(vid, merged, fps, step, out_dir, cfg_snapshot)
+    write_autocut_checkpoint(vid, merged, fps, step, out_dir, cfg_snapshot, segment_results=segment_results)
 
     export_ok = run_export_only(vid, merged, fps, out_dir, cfg, resolve_py=resolve_py)
 

@@ -1,10 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Build (from this folder): pyinstaller scenecut_gui.spec
-# Requires: pip install pyinstaller pyinstaller-hooks-contrib
+# One-folder build: dist/ScenecutNVIDIA/ScenecutNVIDIA.exe + _internal (or similar).
+# Total size ~= one-file, but the main .exe is small; ship the whole folder as a ZIP.
 
 import pathlib
 
-# PyInstaller sets SPECPATH to the folder that contains the .spec file (not the file path).
 try:
     _sp = pathlib.Path(SPECPATH).resolve()
     spec_dir = _sp if _sp.is_dir() else _sp.parent
@@ -24,13 +23,12 @@ except ImportError as e:
         '(same Python you use for PyInstaller)'
     ) from e
 
-# Method A + video-player analyze import analyzer lazily — without collect_all, torch etc. stay out of the EXE.
 for _need in ('torch', 'onnxruntime', 'faster_whisper', 'ctranslate2'):
     try:
         __import__(_need)
     except ImportError as e:
         raise SystemExit(
-            f'Missing package: {_need} (needed for Method A and scene analysis in the EXE)\n'
+            f'Missing package: {_need}\n'
             '  python -m pip install -r requirements.txt\n'
             '(same Python as: python -m PyInstaller ...)'
         ) from e
@@ -86,21 +84,28 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='ScenecutNVIDIA',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='ScenecutNVIDIA',
 )
