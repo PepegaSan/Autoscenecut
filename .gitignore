@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Local INI (use config_nvidia.example.ini)
+config_nvidia.ini
+
+# Not for public repo (see github_kit/README.md)
+design_kit/
+github_kit/
+Davinci API start/
+
+# Runtime output (includes output/algo_runs/ local tuning JSON)
+output/
+*.log
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Temp / local
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Optional local binaries
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe

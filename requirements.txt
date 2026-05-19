@@ -1,0 +1,21 @@
+# GUI
+customtkinter
+tkinterdnd2
+opencv-python
+pillow
+numpy
+
+# PyTorch mit CUDA: passenden Index wählen, z.B.
+# pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch
+
+# Whisper: GPU über ctranslate2 / cuBLAS (Zugriff wie bei CUDA-PyTorch)
+faster-whisper
+
+# YAMNet: für NVIDIA-GPU bitte GPU-Build (nicht gleichzeitig onnxruntime CPU installieren)
+# pip uninstall onnxruntime onnxruntime-gpu -y && pip install onnxruntime-gpu
+onnxruntime-gpu
+
+# Optional / nicht für diese Pipeline nötig
+# tensorflow
+# tensorflow-hub
