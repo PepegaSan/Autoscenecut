@@ -16,10 +16,12 @@ GPU, then every slider change shows its result instantly.
 - Optional: DaVinci Resolve **Studio** for loading timelines directly
   (*Preferences → System → General → External scripting using = Local*, then restart Resolve)
 
-```bash
-pip install -r requirements.txt
-python scenecut_app.py
-```
+**Install:** run `install.bat` – it finds (or installs via winget) Python 3.12, creates a
+`.venv` in this folder with the packages from `requirements.txt` and checks for FFmpeg.
+
+**Start:** `start.bat` (no console window). Videos dropped onto `start.bat` are added right away.
+
+Manual alternative: `pip install -r requirements.txt`, then `python scenecut_app.py`.
 
 ## Using it
 
