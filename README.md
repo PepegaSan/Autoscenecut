@@ -1,98 +1,81 @@
-# Scenecut NVIDIA
+# Scenecut
 
-Desktop tool (CustomTkinter GUI) to analyze video segments and auto-export only selected scene categories (dialogue, action, vocal, etc.).
+Cuts long videos down to the scenes that matter – by motion and sound – and loads the result
+straight into a DaVinci Resolve timeline (or writes XML / EDL / MP4).
 
-## Features
-- Drag and drop source video in GUI
-- Start / Pause / Stop from the source workflow
-- Segment analysis with faster-whisper + OpenCV + YAMNet
-- Export via FFmpeg (NVENC), or DaVinci Studio XML/EDL/AUTO-RENDER
-- Retry export from checkpoint without full re-analysis
+One pass over picture and sound: about **1 minute per 100 minutes of video** on an RTX-class
+GPU, then every slider change shows its result instantly.
+
+![Scenecut](images/scenecut.png)
 
 ## Requirements
-- Windows 10/11
-- Python 3.10+
-- FFmpeg in PATH (`ffmpeg`, `ffprobe`)
-- Optional: NVIDIA GPU + CUDA-compatible stack for acceleration
-- Optional: DaVinci Resolve for XML/EDL/AUTO-RENDER workflows
 
-## Install
+- Windows 10/11, Python 3.12 (the version DaVinci Resolve's scripting expects)
+- FFmpeg on `PATH` (`ffmpeg`, `ffprobe`, and `ffplay` for the preview)
+- Optional: NVIDIA GPU – decoding uses NVDEC, MP4 export uses NVENC (falls back to CPU / x264)
+- Optional: DaVinci Resolve **Studio** for loading timelines directly
+  (*Preferences → System → General → External scripting using = Local*, then restart Resolve)
+
 ```bash
 pip install -r requirements.txt
+python scenecut_app.py
 ```
 
-## Run GUI
+## Using it
+
+1. **Drop videos or folders** anywhere into the window. They are analyzed one after the other;
+   a second open is instant (analysis cache in `%LOCALAPPDATA%\Scenecut\cache`).
+2. **Pick a preset** – *Highlights*, *Standard* (automatic per video), *Großzügig* – or set the
+   categories yourself: motion / action, vocal sounds, dialogue (cut out / ignore / keep), music.
+   The *Feinschliff* tab has minimum scene length, gap closing, padding and smoothing.
+3. **Read the timeline**: the *Bleibt* lane and the green background show exactly what is kept.
+   Click to play from there (ffplay, optionally muted).
+4. **Fix outliers yourself**: drag over a range or right-click a stretch → *always keep* /
+   *always cut*. These corrections win over all sliders and are saved per video.
+5. **Export**
+   - *Direkt in DaVinci laden*: new timeline in the open Resolve project (Resolve is started if
+     needed; existing timelines are never touched)
+   - DaVinci timeline file (FCP7 XML) or EDL
+   - finished MP4
+   - Timeline content: only the kept parts, or the whole video cut at every scene edge
+     (direct load colours kept parts green, the rest orange)
+
+Settings are remembered in `scenecut_settings.json` next to the app.
+
+## How it decides
+
+- **Picture**: one sequential ffmpeg decode into 160×90 grayscale at 10 fps. Per frame the
+  difference to the previous one, with camera motion removed by phase correlation – pans count
+  less than motion in the picture. Cuts are isolated difference spikes.
+- **Sound**: the whole track through YAMNet (`yamnet.onnx`) – speech, vocal sounds, music,
+  silence per 0.48 s.
+- **Decision**: motion threshold as a percentile of the video itself (automatic split by
+  default), hysteresis, gap closing, minimum length, edges snapped to cuts, then the manual
+  corrections on top.
+
+## Command line
+
 ```bash
-python gui_nvidia.py
+python fast_scan.py VIDEO [--motion-level 60] [--speech remove|ignore|keep] [--export xml,edl,mp4]
 ```
 
+## Files
 
-## Windows executable (optional, for GitHub Releases)
+| File | |
+|---|---|
+| `scenecut_app.py` | the app (tkinter + tkinterdnd2) |
+| `fast_scan.py` | analysis, decision, MP4 export, manual corrections |
+| `davinci_timeline.py` | loads segments into a Resolve timeline |
+| `davinci_api.py` | Resolve connection (vendored from the Hail Mary project) |
+| `timeline_export.py` | FCP7 XML and CMX EDL files |
+| `yamnet.onnx`, `yamnet_class_map.csv` | sound classification model |
 
-### If you use **Conda** (e.g. env `autocut_env`)
+## Tests
 
-1. Open **Anaconda Prompt** (or any shell where `conda` works).
-2. `cd` to this folder, then:
-   ```bat
-   conda activate autocut_env
-   pip install -r requirements.txt
-   pip install -r requirements-build.txt
-   ```
-3. Build **without** switching interpreters:
-   ```bat
-   build_gui_exe_conda.bat
-   ```
-   That script uses `conda run -n autocut_env` so it always bundles the same env you use for the app. To use another env name, edit `CONDA_ENV=...` at the top of `build_gui_exe_conda.bat`.
+```bash
+python tests/test_fast_scan.py
+python tests/test_davinci_timeline.py
+python tests/test_timeline_export.py
+```
 
-If the batch **stopped right after** printing the Python version, you were likely using a `.bat` that called `conda run` **without** `call`. In Windows CMD, the next lines never run. Current `build_gui_exe_conda.bat` uses **`call conda run`** — run it again.
-
-If you still fail at the dependency step, `build_check_deps.py` prints **which** module is missing; install with `pip install -r requirements.txt` inside the env.
-
-### Plain Python (no Conda)
-
-1. Install runtime deps: `pip install -r requirements.txt` (must include **tkinterdnd2**).
-2. Install build tools: `pip install -r requirements-build.txt`
-3. Run `build_gui_exe.bat` (or `python -m PyInstaller --noconfirm --clean scenecut_gui.spec` from this folder).
-
-Use the **same** `python` / venv for steps 1–3. If PyInstaller uses Python A but `tkinterdnd2` is only installed for Python B, the EXE will crash with `No module named 'tkinterdnd2'`.
-
-The build **must** see **torch**, **onnxruntime**, **faster-whisper**, and **ctranslate2** (same as `requirements.txt`), or **Method A** and **Analyze** in the video player will fail in the EXE with missing modules. The `.spec` bundles them via `collect_all`; the EXE becomes **much larger** and the first build takes longer — that is expected.
-
-### Why is the one-file `.exe` ~1 GB (or more)?
-
-That is **normal** for this stack. A single-file build packs **PyTorch** (often **CUDA** wheels, hundreds of MB), **ONNX Runtime** (especially **GPU** builds), **ctranslate2** (Whisper backend), **OpenCV**, **NumPy**, etc. into one self-contained blob. You are not doing anything wrong.
-
-**Ways to shrink (trade-offs):**
-
-- **CPU-only PyTorch** in the build environment (`pip install torch` CPU index) → much smaller EXE, **no GPU** for torch in the bundled app.
-- **Keep GPU** → expect roughly **0.8–1.5+ GB** one-file; hard to avoid without dropping features.
-- **One-folder build** (same total bytes, easier to ship as a ZIP; small launcher `ScenecutNVIDIA.exe` + `_internal` folder):  
-  `python -m PyInstaller --noconfirm --clean scenecut_gui_onedir.spec`  
-  Output: `dist/ScenecutNVIDIA/` — zip the **whole folder** for releases.
-
-Output (one-file): `dist/ScenecutNVIDIA.exe`. Distribute that file; on first run it creates `config_nvidia.ini` and an `output/` folder **next to the exe**.
-
-**Drag & drop:** `tkinterdnd2` is bundled via PyInstaller. On some PCs one-file builds can still misbehave (AV, elevation, Explorer). If drag & drop fails, run `python gui_nvidia.py` from source, or switch the `.spec` to a **one-folder** (`COLLECT`) build — see [PyInstaller docs](https://pyinstaller.org).
-
-**FFmpeg:** still must be installed separately and on `PATH` (the exe does not bundle ffmpeg).
-
-## Config
-- `config_nvidia.ini` ships with sensible defaults. `resolve_api_path` is set to Blackmagic’s usual **Windows** folder under `ProgramData` (adjust if your Resolve install differs).
-- Set `davinci_python_path` when using the standalone EXE with DaVinci AUTO-RENDER (⚙ Settings in the GUI).
-- Keep machine-specific overrides out of git if you fork the repo; use `config_nvidia.example.ini` as a template.
-
-## Notes
-- `yamnet.onnx` and `yamnet_class_map.csv` are included for audio-classification features.
-- `output/` is runtime data and excluded from version control.
-- Optional segment profiling (worker): set `SCENECUT_PROFILE` to `1` / `first` (first segment only), a number (first N segments), or `all`. Optional `SCENECUT_PROFILE_OUT=path.dump` writes binary stats (`pstats.Stats` can load it).
-
-## Screenshots
-![Tab 1](images/Tab1.png)
-![Tab 2](images/Tab2.png)
-![Tab 3](images/Tab3.png)
-
-## Credit
-Thanks OpenAi for the Whisper-Modell
-Google/Tensorflow for YAMNet-Model
-`yamnet_class_map.csv`from this scource: https://github.com/tensorflow/models/blob/master/research/audioset/yamnet/yamnet_class_map.csv
-`yamnet.onnx` form this source https://huggingface.co/zeropointnine/yamnet-onnx/tree/main and special thanks, without the easy access to an onnx file the project wouldn't be possible for me.
+No GPU or Resolve needed; the Resolve tests use a small fake of its object model.
