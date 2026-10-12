@@ -933,6 +933,10 @@ def scene_source_frames(
     return start_f, end_f
 
 
+# Clips per AppendToTimeline call (same limit as marker_autocut).
+APPEND_BATCH = 48
+
+
 def append_scenes_sequential(
     media_pool: Any,
     timeline: Any,
@@ -942,36 +946,28 @@ def append_scenes_sequential(
     clip_frames: int = 0,
 ) -> int:
     """
-    Append trimmed segments back-to-back. recordFrame follows each item's GetEnd()+1
-    so timeline gaps cannot appear when FPS metadata was wrong.
+    Append trimmed segments back-to-back: batched AppendToTimeline calls without
+    recordFrame, so Resolve places each clip directly after the previous one.
+
+    (Placing each clip at GetEnd()+1 left one empty frame per cut: GetEnd() is
+    already the first frame after the item. Same approach as clip_joiner /
+    marker_autocut.)
     """
-    try:
-        rec = int(timeline.GetStartFrame() or 0)
-    except Exception:
-        rec = 0
-    count = 0
+    infos = []
     for start_sec, end_sec in scenes_sec:
         start_f, end_f = scene_source_frames(start_sec, end_sec, analysis_fps, clip_frames)
-        items = media_pool.AppendToTimeline(
-            [
-                {
-                    "mediaPoolItem": clip,
-                    "startFrame": start_f,
-                    "endFrame": end_f,
-                    "recordFrame": rec,
-                }
-            ]
-        )
-        if not items:
+        infos.append({"mediaPoolItem": clip, "startFrame": start_f, "endFrame": end_f})
+    count = 0
+    for i in range(0, len(infos), APPEND_BATCH):
+        batch = infos[i : i + APPEND_BATCH]
+        items = media_pool.AppendToTimeline(batch) or []
+        if len(items) != len(batch):
+            first = scenes_sec[i + len(items)] if i + len(items) < len(scenes_sec) else scenes_sec[i]
             raise ResolveError(
-                f"AppendToTimeline failed for scene {start_sec:.3f}s–{end_sec:.3f}s "
-                f"(frames {start_f}–{end_f})."
+                f"AppendToTimeline failed for scene {first[0]:.3f}s–{first[1]:.3f}s "
+                f"({count + len(items)} of {len(infos)} scenes placed)."
             )
-        count += 1
-        try:
-            rec = int(items[0].GetEnd()) + 1
-        except Exception:
-            rec += max(1, end_f - start_f)
+        count += len(items)
     return count
 
 
