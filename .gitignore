@@ -6,15 +6,16 @@ __pycache__/
 .venv/
 venv/
 
-# Local INI (use config_nvidia.example.ini)
+# Local settings (scenecut_settings.json is written by the app; config_nvidia.ini is from the old tool)
+scenecut_settings.json
 config_nvidia.ini
 
-# Not for public repo (see github_kit/README.md)
+# Local folders, not for the public repo
 design_kit/
 github_kit/
 Davinci API start/
 
-# Runtime output (includes output/algo_runs/ local tuning JSON)
+# Test / runtime output
 output/
 *.log
 

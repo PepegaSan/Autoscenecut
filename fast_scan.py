@@ -1,0 +1,724 @@
+"""Fast single-pass scene scan: motion + sound.
+
+Picture: one sequential ffmpeg decode (NVDEC if available) into tiny grayscale frames, no
+seeking. Per frame: difference to the previous frame and a camera-motion-compensated difference
+(phase correlation), so pans count less than motion in the picture. Cuts are isolated
+difference spikes (see detect_cuts).
+
+Sound: the whole track decoded once (16 kHz mono) and run through YAMNet in 60 s blocks, at
+the same time as the picture. Per 0.48 s: speech, vocal (moan, breath, scream …), music,
+silence and loudness.
+
+All curves end up on one 10 fps grid. decide() turns them into keep-segments from a Settings
+object; that part takes milliseconds, so the GUI can redo it on every slider move. The
+analysis is cached next to the output (<video>.features.npz).
+
+Usage:
+    python fast_scan.py VIDEO [--out DIR] [--no-cache] [--motion-level 60] [--export xml,edl,mp4]
+"""
+import argparse
+import csv
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import warnings
+from dataclasses import asdict, dataclass, fields
+
+import cv2
+import numpy as np
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+W, H = 160, 90
+SAMPLE_FPS = 10.0
+FEATURES_VERSION = 3
+
+AUDIO_SR = 16000
+YAMNET_HOP = 7680  # samples (0.48 s)
+YAMNET_WINDOW = 15600  # samples (0.975 s)
+AUDIO_BLOCK = YAMNET_HOP * 125  # 60 s per model call
+
+# YAMNet display names (lower case) per group; group score = highest class probability
+AUDIO_GROUPS = {
+    'speech': ['speech', 'male speech, man speaking', 'female speech, woman speaking',
+               'child speech, kid speaking', 'conversation', 'narration, monologue'],
+    'vocal': ['whimper', 'wail, moan', 'sigh', 'groan', 'grunt', 'breathing', 'gasp', 'pant',
+              'screaming', 'shout', 'yell', 'crying, sobbing'],
+    'music': ['music', 'musical instrument', 'vocal music', 'background music', 'soundtrack music',
+              'pop music', 'electronic music', 'hip hop music', 'rock music', 'electronic dance music'],
+    'silence': ['silence'],
+}
+AUDIO_KEYS = ('speech', 'vocal', 'music', 'silence', 'loud')
+VIDEO_KEYS = ('diff', 'motion', 'luma')
+
+
+class Cancelled(Exception):
+    pass
+
+
+def _module_dir():
+    return getattr(sys, '_MEIPASS', None) or os.path.dirname(os.path.abspath(__file__))
+
+
+def probe(video):
+    out = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,r_frame_rate:format=duration',
+         '-of', 'json', video],
+        capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
+    )
+    info = json.loads(out.stdout or '{}')
+    streams = info.get('streams', [])
+    v = next((s for s in streams if s.get('codec_type') == 'video'), {})
+    num, _, den = (v.get('r_frame_rate') or '30/1').partition('/')
+    fps = float(num) / float(den or 1) if float(den or 1) else 30.0
+    has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+    return float(info.get('format', {}).get('duration') or 0.0), fps, has_audio
+
+
+# ---------- Picture ----------
+
+def iter_frames(video, hwaccel=True, cancel=None):
+    """Yield (H, W) uint8 frames at SAMPLE_FPS from one sequential decode."""
+    cmd = ['ffmpeg', '-v', 'error', '-nostdin']
+    if hwaccel:
+        cmd += ['-hwaccel', 'cuda']
+    cmd += ['-i', video, '-an', '-sn', '-dn',
+            '-vf', f'fps={SAMPLE_FPS},scale={W}:{H}:flags=area,format=gray',
+            '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=CREATE_NO_WINDOW)
+    # Drain stderr so a chatty ffmpeg can't block on a full pipe
+    err_lines = []
+    t_err = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
+    t_err.start()
+    size = W * H
+    n = 0
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                raise Cancelled()
+            buf = proc.stdout.read(size)
+            if len(buf) < size:
+                break
+            n += 1
+            yield np.frombuffer(buf, np.uint8).reshape(H, W)
+    finally:
+        proc.stdout.close()
+        proc.wait()
+        t_err.join(timeout=2)
+    if n == 0 and hwaccel:
+        yield from iter_frames(video, hwaccel=False, cancel=cancel)
+    elif n == 0:
+        err = b''.join(err_lines).decode(errors='replace').strip()
+        raise RuntimeError('ffmpeg: ' + (err.splitlines()[-1] if err else f'exit {proc.returncode}'))
+
+
+def extract_video_features(video, duration, progress=None, cancel=None):
+    """Per-frame arrays (index i compares frame i with frame i-1; index 0 is zero)."""
+    window = cv2.createHanningWindow((W, H), cv2.CV_32F)
+    diff, motion, luma = [], [], []
+    prev = None
+    for i, f in enumerate(iter_frames(video, cancel=cancel)):
+        g = f.astype(np.float32) * (1.0 / 255.0)
+        luma.append(float(g.mean()))
+        if prev is None:
+            diff.append(0.0)
+            motion.append(0.0)
+        else:
+            d_all = float(np.abs(g - prev).mean())
+            # Window applied to copies: cv2.phaseCorrelate multiplies its inputs in place (OpenCV 4.13)
+            (dx, dy), _ = cv2.phaseCorrelate(prev * window, g * window)
+            if abs(dx) < W / 4 and abs(dy) < H / 4:
+                warped = cv2.warpAffine(prev, np.float32([[1, 0, dx], [0, 1, dy]]), (W, H),
+                                        borderMode=cv2.BORDER_REPLICATE)
+                mx, my = int(abs(dx)) + 2, int(abs(dy)) + 2
+                resid = float(np.abs(g - warped)[my:H - my, mx:W - mx].mean())
+                m = min(d_all, resid)
+            else:
+                m = d_all
+            diff.append(d_all)
+            motion.append(m)
+        prev = g
+        if progress and i % 300 == 0 and duration > 0:
+            progress(min(1.0, i / SAMPLE_FPS / duration))
+    return {'diff': np.asarray(diff, np.float32), 'motion': np.asarray(motion, np.float32),
+            'luma': np.asarray(luma, np.float32)}
+
+
+# ---------- Sound ----------
+
+_YAMNET = None
+
+
+def load_yamnet():
+    """(onnx session, {group: [class indices]}) or None if model / onnxruntime are missing."""
+    global _YAMNET
+    if _YAMNET is not None:
+        return _YAMNET or None
+    _YAMNET = False
+    model = os.path.join(_module_dir(), 'yamnet.onnx')
+    classmap = os.path.join(_module_dir(), 'yamnet_class_map.csv')
+    if not (os.path.isfile(model) and os.path.isfile(classmap)):
+        return None
+    try:
+        import onnxruntime as ort
+        providers = [p for p in ('CUDAExecutionProvider', 'CPUExecutionProvider')
+                     if p in ort.get_available_providers()]
+        sess = ort.InferenceSession(model, providers=providers)
+    except Exception as e:
+        print(f'YAMNet not available: {e}', flush=True)
+        return None
+    with open(classmap, encoding='utf-8') as f:
+        names = [(row.get('display_name') or '').strip().lower() for row in csv.DictReader(f)]
+    groups = {g: [i for i, n in enumerate(names) if n in terms] for g, terms in AUDIO_GROUPS.items()}
+    _YAMNET = (sess, groups)
+    return _YAMNET
+
+
+def extract_audio_features(video, cancel=None):
+    """Per YAMNet frame (0.48 s): group scores 0..1 and loudness (dBFS). None without sound/model."""
+    ym = load_yamnet()
+    if ym is None:
+        return None
+    sess, groups = ym
+    inp = sess.get_inputs()[0].name
+    cmd = ['ffmpeg', '-v', 'error', '-nostdin', '-i', video, '-vn', '-sn', '-dn',
+           '-ac', '1', '-ar', str(AUDIO_SR), '-f', 'f32le', '-']
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            creationflags=CREATE_NO_WINDOW)
+    out = {g: [] for g in groups}
+    loud = []
+    carry = np.zeros(0, np.float32)
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                raise Cancelled()
+            buf = proc.stdout.read(AUDIO_BLOCK * 4)
+            new = np.frombuffer(buf[:len(buf) // 4 * 4], np.float32)
+            w = np.concatenate([carry, new])
+            eof = len(buf) < AUDIO_BLOCK * 4
+            # Frame k covers w[k*HOP : k*HOP+WINDOW]; only frames that fit completely, the rest
+            # carries over – the model's own end padding would shift the grid by a frame now and then
+            if eof:
+                if len(w) == 0:
+                    break
+                n = max(1, int(np.ceil(len(w) / YAMNET_HOP)))
+            else:
+                n = (len(w) - YAMNET_WINDOW) // YAMNET_HOP + 1
+                if n < 1:
+                    carry = w
+                    continue
+            x = w[:(n - 1) * YAMNET_HOP + YAMNET_WINDOW]
+            x = np.pad(x, (0, (n - 1) * YAMNET_HOP + YAMNET_WINDOW - len(x)))
+            carry = w[n * YAMNET_HOP:]
+            scores = np.asarray(sess.run(None, {inp: x})[0])[:n]
+            for g, idx in groups.items():
+                out[g].append(scores[:, idx].max(axis=1) if idx else np.zeros(len(scores)))
+            frames = np.lib.stride_tricks.sliding_window_view(x, YAMNET_WINDOW)[::YAMNET_HOP][:n]
+            rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+            loud.extend((20 * np.log10(np.maximum(rms, 1e-5))).tolist())
+            if eof:
+                break
+    finally:
+        proc.stdout.close()
+        proc.wait()
+    if not loud:
+        return None
+    res = {g: np.concatenate(v).astype(np.float32) for g, v in out.items()}
+    res['loud'] = np.asarray(loud, np.float32)
+    res['t'] = (np.arange(len(loud)) * YAMNET_HOP + YAMNET_WINDOW / 2) / AUDIO_SR
+    return res
+
+
+# ---------- Analysis (cached) ----------
+
+def default_cache_dir():
+    root = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    return os.path.join(root, 'Scenecut', 'cache')
+
+
+def _cache_path(video, cache_dir):
+    import hashlib
+    base = os.path.splitext(os.path.basename(video))[0]
+    tag = hashlib.sha1(os.path.normcase(video).encode('utf-8')).hexdigest()[:8]
+    return os.path.join(cache_dir, f'{base}.{tag}.features.npz')
+
+
+def _stamp(video):
+    st = os.stat(video)
+    return np.asarray([st.st_size, st.st_mtime, FEATURES_VERSION, SAMPLE_FPS], np.float64)
+
+
+def analyze(video, cache_dir=None, use_cache=True, progress=None, cancel=None):
+    """Full analysis as a dict of equally long arrays on the SAMPLE_FPS grid + meta.
+
+    progress(share 0..1, text) is called from this thread.
+    """
+    video = os.path.abspath(video)
+    cache_dir = cache_dir or default_cache_dir()
+    cache = _cache_path(video, cache_dir)
+    stamp = _stamp(video)
+    if use_cache and os.path.isfile(cache):
+        try:
+            z = np.load(cache)
+            if 'stamp' in z.files and np.array_equal(z['stamp'], stamp):
+                an = {k: z[k] for k in z.files if k != 'stamp'}
+                an['meta'] = json.loads(str(an['meta']))
+                an['meta']['from_cache'] = True
+                return an
+        except Exception:
+            pass
+
+    duration, fps, has_audio = probe(video)
+    t0 = time.time()
+    audio = {}
+    audio_err = []
+
+    def run_audio():
+        try:
+            audio['res'] = extract_audio_features(video, cancel)
+        except Exception as e:  # sound is optional, the picture is not
+            audio_err.append(e)
+
+    t_audio = threading.Thread(target=run_audio, daemon=True)
+    if has_audio:
+        t_audio.start()
+    rep = (lambda p: progress(p * 0.97, 'Bild und Ton werden analysiert …')) if progress else None
+    an = extract_video_features(video, duration, progress=rep, cancel=cancel)
+    if has_audio:
+        t_audio.join()
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+    n = len(an['diff'])
+    t_grid = np.arange(n) / SAMPLE_FPS
+    a = audio.get('res')
+    for k in AUDIO_KEYS:
+        if a is not None:
+            an[k] = np.interp(t_grid, a['t'], a[k]).astype(np.float32)
+        else:
+            an[k] = np.zeros(n, np.float32)
+    an['meta'] = {
+        'video': video, 'duration': duration, 'fps': fps, 'sample_fps': SAMPLE_FPS,
+        'has_audio': a is not None, 'audio_error': str(audio_err[0]) if audio_err else '',
+        'analysis_sec': round(time.time() - t0, 2),
+    }
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        np.savez_compressed(cache, stamp=stamp, meta=json.dumps(an['meta']),
+                            **{k: an[k] for k in VIDEO_KEYS + AUDIO_KEYS})
+    except OSError as e:
+        print(f'Cache not written: {e}', flush=True)
+    if progress:
+        progress(1.0, 'Fertig')
+    return an
+
+
+# ---------- Decision ----------
+
+@dataclass
+class Settings:
+    motion_keep: bool = True
+    motion_level: float = -1.0  # percentile of the motion curve, 0..100; < 0 = automatic
+    vocal_keep: bool = True
+    vocal_level: float = 30.0  # YAMNet vocal probability in %
+    speech_mode: str = 'remove'  # ignore | keep | remove
+    speech_level: float = 45.0
+    music_keep: bool = False
+    music_level: float = 50.0
+    smooth_s: float = 2.0
+    merge_gap_s: float = 3.0
+    min_len_s: float = 4.0
+    pad_s: float = 0.0
+    snap_s: float = 1.5
+
+    @classmethod
+    def from_dict(cls, d):
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in (d or {}).items() if k in names})
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def detect_cuts(diff, min_diff=0.08, min_peak=3.0, min_peak_busy=1.5, k=3, min_gap_s=0.5):
+    """A cut is an isolated spike: big difference to the previous frame, standing out from the
+    frames on both sides – clearly from the calmer side, at least somewhat from the busier one.
+    Fast motion gives high differences too, just not isolated ones, and motion that stops or
+    starts abruptly only stands out from one side (pmvscan.js's 'diff vs. recent median' alone
+    fires constantly on long, busy shots)."""
+    diff = np.asarray(diff, np.float64)
+    n = len(diff)
+    if n < 2 * k + 2:
+        return np.zeros(0, np.int64)
+    padded = np.pad(diff, (k, k), mode='edge')
+    win = np.lib.stride_tricks.sliding_window_view(padded, 2 * k + 1)
+    left = np.median(win[:, :k], axis=1)
+    right = np.median(win[:, k + 1:], axis=1)
+    calm = np.maximum(np.minimum(left, right), 1e-4)
+    busy = np.maximum(np.maximum(left, right), 1e-4)
+    cand = np.flatnonzero((diff >= min_diff) & (diff >= min_peak * calm) & (diff >= min_peak_busy * busy))
+    cuts = []
+    min_gap = int(min_gap_s * SAMPLE_FPS)
+    for i in cand:
+        if i == 0 or i >= n - 1:
+            continue
+        if cuts and i - cuts[-1] < min_gap:
+            if diff[i] > diff[cuts[-1]]:
+                cuts[-1] = int(i)
+            continue
+        cuts.append(int(i))
+    return np.asarray(cuts, np.int64)
+
+
+def rolling_nanmedian(x, win):
+    half = win // 2
+    padded = np.pad(x, (half, half), mode='edge')
+    view = np.lib.stride_tricks.sliding_window_view(padded, win)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN windows → NaN
+        out = np.nanmedian(view, axis=1)
+    return out[:len(x)]
+
+
+def rolling_mean(x, win):
+    if win <= 1:
+        return np.asarray(x, np.float64)
+    half = win // 2
+    padded = np.pad(np.asarray(x, np.float64), (half, win - 1 - half), mode='edge')
+    return np.convolve(padded, np.ones(win) / win, mode='valid')
+
+
+def otsu_threshold(values, bins=256):
+    v = values[np.isfinite(values)]
+    hist, edges = np.histogram(v, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    w0 = np.cumsum(hist)
+    w1 = w0[-1] - w0
+    m0 = np.cumsum(hist * centers)
+    mu0 = m0 / np.maximum(w0, 1)
+    mu1 = (m0[-1] - m0) / np.maximum(w1, 1)
+    between = w0 * w1 * (mu0 - mu1) ** 2
+    return float(centers[int(np.argmax(between))])
+
+
+MOTION_BAND = 0.2  # hysteresis width on the log motion curve (±10 %)
+
+
+def motion_log_curve(motion, cuts, smooth_s):
+    """Log motion, cut frames masked, smoothed (median), gaps filled with the value before."""
+    m = np.asarray(motion, np.float64).copy()
+    for c in cuts:
+        m[max(0, c - 1):c + 2] = np.nan
+    m[0] = np.nan
+    logm = rolling_nanmedian(np.log(np.maximum(m, 1e-4)), int(smooth_s * SAMPLE_FPS) | 1)
+    for i in range(len(logm)):
+        if not np.isfinite(logm[i]):
+            logm[i] = logm[i - 1] if i else np.log(1e-4)
+    return logm
+
+
+def hysteresis(curve, level, band=4.0):
+    hi, lo = level + band / 2, level - band / 2
+    on = np.zeros(len(curve), bool)
+    state = False
+    for i, v in enumerate(curve):
+        if state and v < lo:
+            state = False
+        elif not state and v > hi:
+            state = True
+        on[i] = state
+    return on
+
+
+def mask_to_runs(mask):
+    m = np.r_[False, np.asarray(mask, bool), False]
+    edges = np.flatnonzero(m[1:] != m[:-1])
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+def fill_gaps(mask, max_gap):
+    out = np.asarray(mask, bool).copy()
+    runs = mask_to_runs(out)
+    for (s0, e0), (s1, _) in zip(runs, runs[1:]):
+        if s1 - e0 <= max_gap:
+            out[e0:s1] = True
+    return out
+
+
+def snap(idx, cuts, max_dist):
+    if len(cuts) == 0:
+        return idx
+    j = int(np.argmin(np.abs(cuts - idx)))
+    return int(cuts[j]) if abs(int(cuts[j]) - idx) <= max_dist else idx
+
+
+def add_span(segs, a, b):
+    """Union of sorted (start, end) spans with [a, b)."""
+    out = []
+    for s0, s1 in sorted(list(segs) + [(a, b)]):
+        if out and s0 <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], s1))
+        else:
+            out.append((s0, s1))
+    return out
+
+
+def cut_span(segs, a, b):
+    """Sorted (start, end) spans minus [a, b)."""
+    out = []
+    for s0, s1 in segs:
+        if s1 <= a or s0 >= b:
+            out.append((s0, s1))
+            continue
+        if s0 < a:
+            out.append((s0, a))
+        if s1 > b:
+            out.append((b, s1))
+    return out
+
+
+def apply_overrides(segs, overrides, duration):
+    """Manual corrections [(start, end, 'keep' | 'drop'), ...] on top of the automatic segments;
+    later ones win. Pieces shorter than 0.1 s are dropped."""
+    for a, b, mode in overrides or []:
+        a, b = max(0.0, float(a)), min(float(duration), float(b))
+        if b <= a:
+            continue
+        segs = add_span(segs, a, b) if mode == 'keep' else cut_span(segs, a, b)
+    return [(round(a, 2), round(b, 2)) for a, b in segs if b - a >= 0.1]
+
+
+def _overrides_path(video, cache_dir=None):
+    return _cache_path(os.path.abspath(video), cache_dir or default_cache_dir()).replace(
+        '.features.npz', '.overrides.json')
+
+
+def load_overrides(video, cache_dir=None):
+    try:
+        with open(_overrides_path(video, cache_dir), encoding='utf-8') as f:
+            return [(float(a), float(b), str(m)) for a, b, m in json.load(f)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_overrides(video, overrides, cache_dir=None):
+    path = _overrides_path(video, cache_dir)
+    if not overrides:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump([[round(a, 2), round(b, 2), m] for a, b, m in overrides], f)
+
+
+def decide(an, s, overrides=None):
+    """Keep-segments (seconds) for one analysis and one Settings object, plus manual corrections
+    (see apply_overrides) that always win over the automatic decision.
+
+    Returns dict: segments, curves (0..100 on the SAMPLE_FPS grid), masks, cuts, auto_motion_level, stats.
+    """
+    n = len(an['diff'])
+    duration = float(an['meta']['duration']) or n / SAMPLE_FPS
+    cuts = detect_cuts(an['diff'])
+    win = max(1, int(s.smooth_s * SAMPLE_FPS))
+
+    # Motion level = percentile ("the busiest 100-level % of this video"), compared on the log
+    # curve itself: a band in percentile units would be razor thin where most frames sit
+    logm = motion_log_curve(an['motion'], cuts, s.smooth_s)
+    otsu = otsu_threshold(logm) if n else 0.0
+    auto_level = float(np.mean(logm < otsu) * 100.0) if n else 50.0
+    level = auto_level if s.motion_level < 0 else float(s.motion_level)
+    thr = otsu if s.motion_level < 0 else float(np.quantile(logm, min(max(level, 0.0), 100.0) / 100.0))
+    # Still pictures (title cards, black) never count as motion, whatever the percentile says
+    still = rolling_mean(an['motion'], win) < 0.002
+    # Display scale 0..100 (1st..99th percentile of this video)
+    lo_v, hi_v = (np.quantile(logm, [0.01, 0.99]) if n else (0.0, 1.0))
+    scale = 100.0 / max(hi_v - lo_v, 1e-6)
+    curves = {
+        'motion': np.clip((logm - lo_v) * scale, 0, 100),
+        'vocal': rolling_mean(an['vocal'], win) * 100.0,
+        'speech': rolling_mean(an['speech'], win) * 100.0,
+        'music': rolling_mean(an['music'], win) * 100.0,
+    }
+    masks = {
+        'motion': hysteresis(logm, thr, band=MOTION_BAND) & ~still,
+        'vocal': hysteresis(curves['vocal'], s.vocal_level),
+        'speech': hysteresis(curves['speech'], s.speech_level),
+        'music': hysteresis(curves['music'], s.music_level),
+    }
+    keep = np.zeros(n, bool)
+    if s.motion_keep:
+        keep |= masks['motion']
+    if s.vocal_keep:
+        keep |= masks['vocal']
+    if s.music_keep:
+        keep |= masks['music']
+    if s.speech_mode == 'keep':
+        keep |= masks['speech']
+    keep = fill_gaps(keep, int(s.merge_gap_s * SAMPLE_FPS))
+    if s.speech_mode == 'remove':
+        keep &= ~masks['speech']
+
+    snap_d = int(s.snap_s * SAMPLE_FPS)
+    segs = []
+    for a, b in mask_to_runs(keep):
+        a, b = snap(a, cuts, snap_d), snap(b, cuts, snap_d)
+        if b - a < s.min_len_s * SAMPLE_FPS:
+            continue
+        t0 = max(0.0, a / SAMPLE_FPS - s.pad_s)
+        t1 = min(duration, b / SAMPLE_FPS + s.pad_s)
+        if segs and t0 <= segs[-1][1]:
+            segs[-1] = (segs[-1][0], max(segs[-1][1], t1))
+        else:
+            segs.append((t0, t1))
+    segs = [(round(a, 2), round(b, 2)) for a, b in segs]
+    if overrides:
+        segs = apply_overrides(segs, overrides, duration)
+    kept = sum(b - a for a, b in segs)
+    return {
+        'segments': segs, 'curves': curves, 'masks': masks, 'keep': keep, 'cuts': cuts,
+        'auto_motion_level': auto_level, 'motion_level': level, 'overrides': list(overrides or []),
+        'motion_line': float(np.clip((thr - lo_v) * scale, 0, 100)),  # threshold on the display scale
+        'stats': {'kept_sec': kept, 'duration': duration, 'share': kept / max(duration, 1e-6),
+                  'segments': len(segs), 'cuts': int(len(cuts))},
+    }
+
+
+def full_length_parts(segments, duration):
+    """The whole video as (start, end, keep) parts, cut at every segment edge."""
+    parts = []
+    t = 0.0
+    for a, b in segments:
+        if a > t + 1e-3:
+            parts.append((t, a, False))
+        parts.append((a, b, True))
+        t = b
+    if duration > t + 1e-3:
+        parts.append((t, duration, False))
+    return parts
+
+
+# ---------- Export ----------
+
+def export_davinci(video, segs, fps, out_dir, kind='xml', full_length=False, duration=None):
+    """kind: xml (FCP7, DaVinci File → Import → Timeline) or edl. Returns the written path.
+
+    full_length: the whole video, cut at every segment edge, clips at their source time.
+    """
+    from timeline_export import export_edl_cmx, export_xml_xmeml
+    base = os.path.splitext(os.path.basename(video))[0]
+    suffix = '_scenecut_full' if full_length else '_scenecut'
+    if full_length:
+        segs = [(a, b) for a, b, _keep in full_length_parts(segs, duration if duration else probe(video)[0])]
+    if kind == 'edl':
+        export_edl_cmx(video, segs, fps, out_dir, at_source_time=full_length)
+        return os.path.join(out_dir, f'{base}{suffix}.edl')
+    export_xml_xmeml(video, segs, fps, out_dir, at_source_time=full_length)
+    return os.path.join(out_dir, f'{base}{suffix}.xml')
+
+
+def _nvenc_ok():
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=256x256:d=0.1',
+                        '-c:v', 'hevc_nvenc', '-f', 'null', '-'],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
+    return r.returncode == 0
+
+
+def export_mp4(video, segs, out_dir, progress=None, cancel=None):
+    """Re-encode every segment frame-accurately (NVENC HEVC, otherwise x264), then join them."""
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(video))[0]
+    final = os.path.join(out_dir, f'{base}_scenecut.mp4')
+    venc = ['-c:v', 'hevc_nvenc', '-preset', 'p4', '-cq', '23'] if _nvenc_ok() else \
+        ['-c:v', 'libx264', '-preset', 'medium', '-crf', '20']
+    tmp_dir = os.path.join(out_dir, f'.{base}_parts')
+    os.makedirs(tmp_dir, exist_ok=True)
+    parts = []
+    total = sum(b - a for a, b in segs) or 1.0
+    done = 0.0
+    try:
+        for i, (a, b) in enumerate(segs):
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            part = os.path.join(tmp_dir, f'{i:04d}.mp4')
+            r = subprocess.run(['ffmpeg', '-y', '-v', 'error', '-ss', f'{a:.3f}', '-i', video,
+                                '-t', f'{b - a:.3f}', '-map', '0:v:0', '-map', '0:a:0?', *venc,
+                                '-c:a', 'aac', '-b:a', '192k', part],
+                               capture_output=True, creationflags=CREATE_NO_WINDOW)
+            if r.returncode != 0:
+                msg = r.stderr.decode(errors='replace').strip().splitlines()
+                raise RuntimeError(f'Segment {i + 1}: ' + (msg[-1] if msg else 'ffmpeg error'))
+            parts.append(part)
+            done += b - a
+            if progress:
+                progress(done / total * 0.97, f'Segment {i + 1}/{len(segs)} gerendert')
+        lst = os.path.join(tmp_dir, 'list.txt')
+        with open(lst, 'w', encoding='utf-8') as f:
+            for p in parts:
+                f.write("file '" + p.replace('\\', '/').replace("'", "'\\''") + "'\n")
+        r = subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', lst,
+                            '-c', 'copy', '-movflags', '+faststart', final],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError('Zusammenfügen fehlgeschlagen: ' + r.stderr.decode(errors='replace')[-300:])
+    finally:
+        for p in os.listdir(tmp_dir) if os.path.isdir(tmp_dir) else []:
+            try:
+                os.remove(os.path.join(tmp_dir, p))
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+    if progress:
+        progress(1.0, 'Fertig')
+    return final
+
+
+# ---------- CLI ----------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('video')
+    ap.add_argument('--out', default=None, help='output folder (default: next to the video)')
+    ap.add_argument('--no-cache', action='store_true')
+    ap.add_argument('--motion-level', type=float, default=-1.0,
+                    help='motion percentile 0..100 to count as action (default: automatic)')
+    ap.add_argument('--no-vocal', action='store_true')
+    ap.add_argument('--speech', choices=('ignore', 'keep', 'remove'), default='remove')
+    ap.add_argument('--export', default='', help='comma list of xml, edl, mp4')
+    args = ap.parse_args()
+
+    video = os.path.abspath(args.video)
+    out_dir = args.out or os.path.dirname(video)
+    t0 = time.time()
+    an = analyze(video, use_cache=not args.no_cache,
+                 progress=lambda p, _t: print(f'PROGRESS:{int(p * 100)}', flush=True))
+    s = Settings(motion_level=args.motion_level, vocal_keep=not args.no_vocal, speech_mode=args.speech)
+    res = decide(an, s)
+    st = res['stats']
+    print(f"Analysis {an['meta']['analysis_sec']} s (this run {time.time() - t0:.1f} s) | sound: "
+          f"{'yes' if an['meta']['has_audio'] else 'no'} | cuts {st['cuts']} | segments {st['segments']} | "
+          f"kept {st['kept_sec'] / 60:.1f} of {st['duration'] / 60:.1f} min ({st['share'] * 100:.0f} %) | "
+          f"motion level {res['motion_level']:.0f} (auto {res['auto_motion_level']:.0f})", flush=True)
+    for kind in [k.strip() for k in args.export.split(',') if k.strip()]:
+        if kind == 'mp4':
+            path = export_mp4(video, res['segments'], out_dir,
+                              progress=lambda p, _t: print(f'PROGRESS:{int(p * 100)}', flush=True))
+        else:
+            path = export_davinci(video, res['segments'], an['meta']['fps'], out_dir, kind)
+        print(f'Exported: {path}', flush=True)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
