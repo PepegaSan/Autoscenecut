@@ -48,7 +48,7 @@ PRESETS = {
                   'Fast alles mit etwas Bewegung oder Stimme bleibt, nur klarer Dialog fliegt raus.'),
 }
 # Chosen separately from the presets: a preset never switches the decision mode
-MODE_KEYS = ('decision', 'strictness', 'block_s')
+MODE_KEYS = ('decision', 'strictness', 'scene_gap_s')
 
 
 def _app_dir():
@@ -372,9 +372,9 @@ class App:
                             ('#ffffff', 'weiß umrandet = selbst behalten'), (C['error'], 'rot = selbst raus')):
             tk.Label(hint_row, text='■', fg=color, bg=C['panel'], font=FONT).pack(side='left')
             ttk.Label(hint_row, text=text + '    ', style='Muted.TLabel').pack(side='left')
-        # Only in score mode: the bars under "Bleibt"
+        # Only in combined mode: the bars under "Bleibt"
         self.cmp_legend = []
-        for color, text in ((C['new'], 'gelber Strich = neu ggü. klassisch'), (C['gone'], 'grauer = fällt weg')):
+        for color, text in ((C['new'], 'gelber Strich = verlängert ggü. klassisch'), (C['gone'], 'grauer = fällt weg')):
             sq = tk.Label(hint_row, text='▬', fg=color, bg=C['panel'], font=FONT)
             lbl = ttk.Label(hint_row, text=text + '    ', style='Muted.TLabel')
             self.cmp_legend.append((sq, lbl))
@@ -421,13 +421,10 @@ class App:
         modes.grid(row=1, column=0, sticky='w', padx=(20, 0))
         for val, text, tip in (
                 ('classic', 'klassisch', 'Bewegung ODER Stimme reicht zum Behalten, jeder Dialog-Treffer schneidet raus.'),
-                ('score', 'kombiniert', 'Alles zählt zusammen: Bewegung, Stimme und Lautstärke dafür, anhaltender '
-                                        'Dialog und Musik dagegen. Leise Bewegung fällt eher raus, einzelne '
-                                        '„Sprache“-Treffer mitten in Action nicht mehr.'),
-                ('blocks', 'Action-Blöcke', 'Entscheidet über ganze zusammenhängende Abschnitte statt Sekunde für '
-                                            'Sekunde – ruhige Momente mitten in der Action bleiben drin. Stimme '
-                                            'zählt am meisten (über 30 s gemittelt). Gewichte aus deinem ersten '
-                                            'komplett geprüften Video, noch vorläufig.')):
+                ('extend', 'kombiniert', 'Die Regler unten wählen wie klassisch aus, WELCHE Szenen bleiben '
+                                         '(z. B. mit „Highlights“). Danach wird jede davon auf die ganze Action '
+                                         'drumherum verlängert: so weit, wie die Bewegung über 30 s gemittelt hoch '
+                                         'bleibt oder Stimme weitergeht – Gerede mittendrin beendet die Szene nicht.')):
             rb = ttk.Radiobutton(modes, text=text, value=val, variable=self.v['decision'], style='Card.TRadiobutton',
                                  command=self._changed)
             rb.pack(side='left', padx=(0, 6))
@@ -489,8 +486,8 @@ class App:
                  'Pausen bis zu dieser Länge zwischen zwei Szenen werden mitgenommen.'),
                 ('pad_s', 'Rand an Schnitten', 0, 5, 's', 'Etwas Luft vor und nach jeder Szene.'),
                 ('smooth_s', 'Glättung', 0.5, 8, 's', 'Höher = ruhigere Entscheidung, weniger Zerstückelung.'),
-                ('block_s', 'Blockgröße', 5, 120, 's',
-                 'Nur Action-Blöcke: höher = weniger, längere Blöcke, auch längere Pausen bleiben drin.'),
+                ('scene_gap_s', 'Pausen in einer Szene', 5, 120, 's',
+                 'Nur kombiniert: so lange darf die Action abflauen, ohne dass die Szene endet.'),
         )):
             self.v[key] = tk.DoubleVar()
             card = self._card(fine, i)
@@ -557,7 +554,7 @@ class App:
         s = self.s
         for k in ('motion_keep', 'vocal_keep', 'music_keep', 'speech_mode', 'vocal_level', 'speech_level',
                   'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s', 'decision', 'strictness',
-                  'block_s'):
+                  'scene_gap_s'):
             self.v[k].set(getattr(s, k))
         self.v['motion_auto'].set(s.motion_level < 0)
         self.v['motion_level'].set(s.motion_level if s.motion_level >= 0 else 50)
@@ -570,17 +567,17 @@ class App:
         s.speech_mode = self.v['speech_mode'].get()
         s.decision = self.v['decision'].get()
         for k in ('vocal_level', 'speech_level', 'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s',
-                  'strictness', 'block_s'):
+                  'strictness', 'scene_gap_s'):
             setattr(s, k, round(float(self.v[k].get()), 1))
         s.motion_level = -1.0 if self.v['motion_auto'].get() else round(float(self.v['motion_level'].get()), 1)
 
     def _sync_motion_widgets(self):
         auto = self.v['motion_auto'].get()
         self.motion_scale.state(['disabled'] if auto else ['!disabled'])
-        score = self.v['decision'].get() != 'classic'
-        self.strict_scale.state(['!disabled'] if score else ['disabled'])
-        self.strict_hint.configure(text='höher = strenger, nur die klarsten Stellen bleiben' if score else
-                                   'Strenge gilt nur für „kombiniert“ und „Action-Blöcke“')
+        extend = self.v['decision'].get() != 'classic'
+        self.strict_scale.state(['!disabled'] if extend else ['disabled'])
+        self.strict_hint.configure(text='höher = Szenen weniger weit verlängern (gelbe Linie in „Bewegung“)'
+                                   if extend else 'Strenge gilt nur für „kombiniert“')
 
     def _changed(self):
         if self._loading:
@@ -815,20 +812,28 @@ class App:
                 cv.create_rectangle(xa, y1 + 1, max(xb, xa + 2), y1 + 5, fill=color, outline='')
         label('keep', 'Bleibt', True)
 
-        # Bewegung (score mode: the combined score): bright where the video stays, dimmed where cut out
+        # Bewegung: bright where the video stays, dimmed where it is cut out
         y0, y1 = lanes['motion']
         lane_bg(y0, y1)
-        score_mode = res.get('score_line') is not None
-        mot = per_px(res['curves']['score' if score_mode else 'motion'], 'mean')
-        on = s.motion_keep or score_mode
+        mot = per_px(res['curves']['motion'], 'mean')
+        on = s.motion_keep
         for i in range(cols):
             yv = y1 - min(max(mot[i], 0), 100) / 100 * (y1 - y0)
             col = (C['motion'] if kept[i] else C['motion_off']) if on else (C['muted'] if kept[i] else C['border'])
             cv.create_line(x0 + i, y1, x0 + i, yv, fill=col)
         if on:
-            ly = y1 - (res['score_line'] if score_mode else res['motion_line']) / 100 * (y1 - y0)
+            ly = y1 - res['motion_line'] / 100 * (y1 - y0)
             cv.create_line(x0, ly, x1, ly, fill=C['text'], dash=(4, 3))
-        label('motion', 'Score' if score_mode else 'Bewegung', on)
+        # Combined mode: the 30 s motion the scenes grow along, and where it stops counting
+        if 'region' in res['curves']:
+            reg = per_px(res['curves']['region'], 'mean')
+            pts = []
+            for i in range(cols):
+                pts += [x0 + i, y1 - min(max(reg[i], 0), 100) / 100 * (y1 - y0)]
+            cv.create_line(*pts, fill=C['new'], width=1)
+            ly = y1 - res['region_line'] / 100 * (y1 - y0)
+            cv.create_line(x0, ly, x1, ly, fill=C['new'], dash=(2, 4))
+        label('motion', 'Bewegung', on)
 
         # Sound lanes
         modes = {'vocal': ('Stimme', s.vocal_keep), 'music': ('Musik', s.music_keep),
@@ -895,8 +900,8 @@ class App:
             txt += ' (neu ggü. klassisch)'
         elif any(a <= t < b for a, b in gone):
             txt += ' (klassisch: bleibt)'
-        if 'score' in c:
-            txt += f"   Score {c['score'][i]:.0f}"
+        if 'region' in c:
+            txt += f"   Bewegung 30 s {c['region'][i]:.0f}"
         txt += f"   Bewegung {c['motion'][i]:.0f}"
         if it.an['meta'].get('has_audio'):
             txt += f"  Stimme {c['vocal'][i]:.0f}  Sprache {c['speech'][i]:.0f}"

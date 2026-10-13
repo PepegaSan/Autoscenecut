@@ -126,67 +126,34 @@ def test_decide_motion_vocal_speech():
     assert segs == [], segs
 
 
-def test_score_mode():
-    # Busy 50–150 s (loud), busy but quiet 200–260 s, a 1 s speech blip inside the action at
-    # 100 s, real dialog with motion 300–360 s (speech 70 % of the time)
+def test_extend_mode():
+    # Two action scenes of moderate motion, each with a short burst of strong motion (the part a
+    # strict classic setting finds): 60–240 s with a burst 120–130, 300–400 s with a burst
+    # 350–360. Inside the first scene a calm 40 s stretch with talk (150–190). 520–570 s: the
+    # same moderate motion but no burst – nothing picked it, so it must not grow into a scene.
     def motion(x):
-        return 0.05 if 50 <= x < 150 or 200 <= x < 260 or 300 <= x < 360 else 0.01
-
-    def speech(x):
-        return 0.9 if 100 <= x < 101 or (300 <= x < 360 and x % 10 < 7) else 0.0
-    an = _fake_analysis(400, motion_fn=motion, speech_fn=speech,
-                        vocal_fn=lambda x: 0.6 if 50 <= x < 150 else 0.0,
-                        loud_fn=lambda x: -45.0 if 200 <= x < 260 else -20.0)
-    base = dict(motion_level=-1, speech_level=40, min_len_s=4, merge_gap_s=2)
-    classic = fs.decide(an, fs.Settings(**base))['segments']
-    assert _overlap(classic, 99, 102) < 2.5, f'classic: the blip cuts a hole into the action: {classic}'
-    res = fs.decide(an, fs.Settings(**base, decision='score', strictness=50))
+        if 120 <= x < 130 or 350 <= x < 360:
+            return 0.2
+        if 150 <= x < 190:
+            return 0.012
+        return 0.05 if (60 <= x < 240 or 300 <= x < 400 or 520 <= x < 570) else 0.01
+    an = _fake_analysis(600, motion_fn=motion, speech_fn=lambda x: 0.8 if 150 <= x < 190 else 0.0)
+    base = dict(motion_level=95, vocal_keep=False, speech_level=40, min_len_s=4, merge_gap_s=2)
+    classic = fs.decide(an, fs.Settings(**base))
+    assert _overlap(classic['segments'], 115, 135) > 8 and _overlap(classic['segments'], 60, 110) == 0, classic['segments']
+    res = fs.decide(an, fs.Settings(**base, decision='extend', strictness=50, scene_gap_s=45))
     segs = res['segments']
-    assert _overlap(segs, 55, 145) > 85, f'score: blip must not cut the action: {segs}'
-    assert _overlap(segs, 305, 355) < 5, f'score: ongoing dialog goes: {segs}'
-    assert _overlap(segs, 0, 45) == 0, segs
-    assert 'score' in res['curves'] and 0 <= res['score_line'] <= 100
-    # strictness: quiet motion goes before loud motion with voice
-    strict = fs.decide(an, fs.Settings(**base, decision='score', strictness=100))['segments']
-    assert _overlap(strict, 205, 255) < _overlap(segs, 205, 255), (strict, segs)
-    assert _overlap(strict, 55, 145) > 85, strict
-    # classic stays exactly as before
-    assert fs.decide(an, fs.Settings(**base, decision='classic'))['segments'] == classic
-    assert fs.decide(an, fs.Settings(**base))['score_line'] is None
-
-
-def test_block_path():
-    gain = np.r_[np.full(10, -1.0), np.full(30, 1.0), np.full(5, -1.0), np.full(30, 1.0), np.full(10, -1.0)]
-    # a short dip inside a long block costs less than two switches
-    assert fs.mask_to_runs(fs.block_path(gain, 10.0)) == [(10, 75)]
-    # cheap switching follows the gain exactly
-    assert fs.mask_to_runs(fs.block_path(gain, 0.5)) == [(10, 40), (45, 75)]
-    # too expensive for any block that does not pay for its two switches
-    assert not fs.block_path(np.r_[np.full(10, -1.0), np.full(5, 1.0), np.full(10, -1.0)], 3.0).any()
-
-
-def test_blocks_mode():
-    # Action 60–300 s with vocal sounds, a calm 40 s stretch inside (150–190: little motion, no
-    # voice, people re-positioning); dialog with motion 400–500 s; quiet nothing elsewhere
-    def motion(x):
-        return 0.05 if (60 <= x < 150 or 190 <= x < 300 or 400 <= x < 500) else 0.01
-
-    def vocal(x):
-        return 0.5 if (60 <= x < 150 or 190 <= x < 300) else 0.0
-
-    def speech(x):
-        return 0.8 if 400 <= x < 500 else 0.0
-    an = _fake_analysis(600, motion_fn=motion, vocal_fn=vocal, speech_fn=speech,
-                        loud_fn=lambda x: -20.0 if 60 <= x < 500 else -40.0)
-    s = fs.Settings(motion_level=-1, speech_level=40, decision='blocks', strictness=50, block_s=60)
-    res = fs.decide(an, s)
-    segs = res['segments']
-    assert len(segs) == 1 and _overlap(segs, 70, 290) > 215, f'one block, calm stretch inside: {segs}'
-    assert _overlap(segs, 410, 490) == 0 and _overlap(segs, 0, 40) == 0, segs
-    assert 0 <= res['score_line'] <= 100 and 'score' in res['curves']
-    # small blocks: the calm stretch goes
-    small = fs.decide(an, fs.Settings(**{**s.to_dict(), 'block_s': 2}))['segments']
-    assert _overlap(small, 165, 175) == 0 and _overlap(small, 70, 140) > 60, small
+    assert _overlap(segs, 65, 235) > 160, f'first scene grows to its full length, talk included: {segs}'
+    assert _overlap(segs, 305, 395) > 85, segs
+    assert _overlap(segs, 520, 570) == 0 and _overlap(segs, 0, 50) == 0, segs
+    assert 'region' in res['curves'] and 0 <= res['region_line'] <= 100
+    # short allowed pauses: the calm talk ends the first scene
+    short = fs.decide(an, fs.Settings(**base, decision='extend', strictness=50, scene_gap_s=5))['segments']
+    assert _overlap(short, 160, 180) == 0 and _overlap(short, 65, 140) > 70, short
+    assert _overlap(short, 200, 235) == 0, f'the rest after the pause has no pick of its own: {short}'
+    # classic stays exactly as before, and old saved modes load as the combined one
+    assert fs.decide(an, fs.Settings(**base, decision='classic'))['segments'] == classic['segments']
+    assert fs.Settings.from_dict({'decision': 'score', 'block_s': 20}).decision == 'extend'
 
 
 def test_override_helpers():
@@ -329,9 +296,7 @@ def main() -> int:
         test_overrides,
         test_settings_roundtrip,
         test_decide_motion_vocal_speech,
-        test_score_mode,
-        test_block_path,
-        test_blocks_mode,
+        test_extend_mode,
         test_override_helpers,
         test_labels_and_export_record,
         test_pool_embeddings,

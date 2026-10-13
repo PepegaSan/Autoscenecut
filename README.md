@@ -58,16 +58,12 @@ Settings are remembered in `scenecut_settings.json` next to the app.
 - **Decision** (*Entscheidung*):
   - *klassisch*: motion threshold as a percentile of the video itself (automatic split by
     default) OR vocal sounds keep a frame, every dialog hit cuts it out.
-  - *kombiniert*: one score per frame – motion, vocal sounds and loudness (rank within the
-    video) count for it, ongoing dialog (share of a 4 s window, only where speech beats vocal
-    sounds) and music against it; *Strenge* sets the bar. Quiet motion drops out, a single
-    "speech" hit in the middle of action no longer cuts a hole. In the timeline a yellow bar
-    marks what is new against *klassisch*, a grey one what goes.
-  - *Action-Blöcke*: decides whole stretches instead of single seconds, so calm moments in the
-    middle of the action stay in. Evidence averaged over 30 s (vocal sounds count most, then
-    motion and loudness, dialog against it); every switch between in and out costs
-    *Blockgröße* seconds of clear evidence (two-state Viterbi). The weights come from the first
-    fully reviewed video and are provisional (`BLOCK_W` in `fast_scan.py`).
+  - *kombiniert*: the same sliders pick WHICH scenes stay (e.g. with *Highlights*), then each
+    picked piece grows to the whole action around it – as far as the motion averaged over
+    30 s stays high or vocal sounds go on; talk in the middle does not end the scene.
+    *Strenge* sets how far scenes grow, *Pausen in einer Szene* how long the action may calm
+    down inside one. In the timeline a yellow bar marks what the growing adds, the yellow
+    line in *Bewegung* is the 30 s motion it follows.
   - Then hysteresis, gap closing, minimum length, edges snapped to cuts, and the manual
     corrections on top.
 
@@ -75,7 +71,8 @@ Settings are remembered in `scenecut_settings.json` next to the app.
 
 Every correction is a label. `python evaluate.py` decides all cached videos with corrections
 again without them and shows how much of what you wanted stays and how much of what you
-removed goes – for all three decision modes (`--sweep`: several strictness levels).
+removed goes – for *klassisch* and *kombiniert* (`--sweep`: several strictness levels,
+`--preset Highlights`: start from an app preset).
 A DaVinci read-back where you confirm that you went through the whole video counts fully:
 everything in the timeline as wanted, everything else as not.
 

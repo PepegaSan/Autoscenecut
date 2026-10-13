@@ -400,14 +400,17 @@ class Settings:
     min_len_s: float = 4.0
     pad_s: float = 0.0
     snap_s: float = 1.5
-    decision: str = 'classic'  # classic: motion OR vocal, dialog cuts out | score: weighted sum | blocks
-    strictness: float = 50.0  # score / blocks: 0 = keep almost everything with some evidence, 100 = only the clearest
-    block_s: float = 30.0  # blocks: what one switch between in and out costs, in seconds of clear evidence
+    decision: str = 'classic'  # classic | extend: classic picks the scenes, then each grows to its action
+    strictness: float = 50.0  # extend: 0 = grow far, 100 = grow little
+    scene_gap_s: float = 30.0  # extend: how long the action may calm down inside one scene
 
     @classmethod
     def from_dict(cls, d):
         names = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in (d or {}).items() if k in names})
+        d = dict(d or {})
+        if d.get('decision') in ('score', 'blocks'):  # earlier experimental modes
+            d['decision'] = 'extend'
+        return cls(**{k: v for k, v in d.items() if k in names})
 
     def to_dict(self):
         return asdict(self)
@@ -665,123 +668,45 @@ def save_overrides(video, overrides, cache_dir=None):
         json.dump([[round(a, 2), round(b, 2), m] for a, b, m in overrides], f)
 
 
-# Score mode: every signal adds or subtracts evidence instead of switching on its own
-# (ratios from a logistic fit on the first corrected videos: dialog weighs about twice as much
-# as motion, vocal sounds about as much, loudness little)
-SCORE_W = {'motion': 1.0, 'vocal': 1.0, 'loud': 0.3, 'dialog': 2.0, 'dialog_keep': 0.8, 'music': 1.0}
-MOTION_SCALE = 0.35  # log motion distance to the threshold that counts as clearly above / below (±35 %)
-SUSTAIN_S = 4.0  # dialog and music count by their share of this window, not by single 0.48 s hits
-SCORE_RANGE = 1.5  # display: score -1.5..1.5 → 0..100
-SCORE_BAND = 0.1
+# Combined mode ("kombiniert"): the classic decision picks WHICH scenes (it is good at that, but
+# keeps only their busiest seconds), then every picked piece grows to the action around it –
+# the stretch where the motion averaged over EXTEND_SMOOTH_S stays high or vocal sounds go on.
+# Talk in the middle of that stretch does not end it. Measured on the first fully reviewed
+# video: classic Highlights touched 14 of 20 wanted scenes but covered only 2–48 % of each.
+EXTEND_SMOOTH_S = 30.0
+EXTEND_VOCAL = 0.4  # vocal sounds above this share of vocal_level keep a scene going
 
 
-def _ramp(x, lo, hi):
-    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+def extend_level(strictness):
+    """Strictness 0..100 → share of the video's (smoothed) motion that counts as quieter than
+    action: 0.3 (grow far) .. 0.7 (grow little)."""
+    return 0.3 + min(max(float(strictness), 0.0), 100.0) / 100.0 * 0.4
 
 
-def score_parts(an, s, logm, thr, still, win):
-    """Evidence per frame, each roughly -1..1 (or 0..1), before weighting.
-
-    motion: log motion relative to the threshold, still pictures -1
-    vocal: 0..1, about 0.6 at vocal_level
-    loud: loudness rank within this video, -1 (quietest) .. 1 (loudest) – motion without sound
-          is usually walking around, setting up, b-roll
-    dialog: share of the SUSTAIN_S window with speech above speech_level that is also stronger
-            than the vocal sounds (YAMNet calls a lot of vocal sounds 'speech') – a single hit
-            costs little, ongoing talk a lot
-    music: music share of the window, 0 below 25 %, 1 above 75 % (intros, credits)
-    """
-    n = len(logm)
-    sus = max(1, int(SUSTAIN_S * SAMPLE_FPS))
-    m = np.tanh((logm - thr) / MOTION_SCALE)
-    m[still] = -1.0
-    parts = {'motion': m}
-    if not an['meta'].get('has_audio'):
-        return parts
-    vocal = rolling_mean(an['vocal'], win) * 100.0
-    parts['vocal'] = 1.0 - np.exp(-vocal / max(s.vocal_level, 1.0))
-    loud = rolling_mean(an['loud'], max(win, int(3 * SAMPLE_FPS)))
-    srt = np.sort(loud)
-    # Mean rank for equal values (digital silence is one value everywhere)
-    rank = (np.searchsorted(srt, loud, 'left') + np.searchsorted(srt, loud, 'right') - 1) / 2.0
-    parts['loud'] = rank / max(n - 1, 1) * 2.0 - 1.0
-    sp = an['speech'] * 100.0
-    dialog_hit = (sp > s.speech_level) & (an['speech'] > an['vocal'])
-    parts['dialog'] = rolling_mean(dialog_hit.astype(np.float64), sus)
-    parts['music'] = _ramp(rolling_mean((an['music'] * 100.0 > s.music_level).astype(np.float64), sus), 0.25, 0.75)
-    return parts
+def grow_to_regions(seed, region):
+    """seed plus every run of region that touches a seed frame."""
+    out = np.asarray(seed, bool).copy()
+    for a, b in mask_to_runs(region):
+        if out[a:b].any():
+            out[a:b] = True
+    return out
 
 
-def combine_score(parts, s):
-    w = SCORE_W
-    score = np.zeros(len(parts['motion']))
-    if s.motion_keep:
-        score += w['motion'] * parts['motion']
-    if 'vocal' not in parts:
-        return score
-    if s.vocal_keep:
-        score += w['vocal'] * parts['vocal']
-    score += w['loud'] * parts['loud']
-    if s.speech_mode == 'remove':
-        score -= w['dialog'] * parts['dialog']
-    elif s.speech_mode == 'keep':
-        score += w['dialog_keep'] * parts['dialog']
-    score += (w['music'] if s.music_keep else -w['music']) * parts['music']
-    return score
-
-
-def score_threshold(strictness):
-    return (min(max(float(strictness), 0.0), 100.0) - 50.0) / 50.0 * 0.8
-
-
-# Blocks mode: whole action stretches instead of second-by-second decisions. Weights are a
-# logistic fit on the first fully reviewed video (30 s averages): vocal sounds carry most,
-# motion and loudness a little, dialog a little against it. Music never occurred there – its
-# weight is a guess. To be refitted once more videos are reviewed (evaluate.py).
-BLOCK_W = {'motion': 0.8, 'vocal': 9.8, 'loud': 0.45, 'dialog': -0.3, 'dialog_keep': 0.3, 'music': 1.0,
-           'bias': -2.1}
-BLOCK_SMOOTH_S = 30.0
-BLOCK_RANGE = 4.0  # display: logit -4..4 → 0..100
-
-
-def block_evidence(parts, s):
-    """Log-odds per frame that this belongs to a wanted block (before the strictness offset)."""
-    w = BLOCK_W
-    if 'vocal' not in parts:  # no sound: motion alone, centred on the motion threshold
-        return parts['motion'] * (1.0 if s.motion_keep else 0.0)
-    ev = np.full(len(parts['motion']), w['bias'])
-    if s.motion_keep:
-        ev += w['motion'] * parts['motion']
-    if s.vocal_keep:
-        ev += w['vocal'] * parts['vocal']
-    ev += w['loud'] * parts['loud']
-    if s.speech_mode == 'remove':
-        ev += w['dialog'] * parts['dialog']
-    elif s.speech_mode == 'keep':
-        ev += w['dialog_keep'] * parts['dialog']
-    ev += (w['music'] if s.music_keep else -w['music']) * parts['music']
-    return ev
-
-
-def block_path(gain, cost):
-    """Best in/out labelling of a per-second gain curve when 'in' earns gain[i], 'out' earns 0
-    and every switch costs `cost` (two-state Viterbi). Returns a bool array."""
-    n = len(gain)
-    if n == 0:
-        return np.zeros(0, bool)
-    back = np.zeros((n, 2), bool)  # True = came from the other state
-    v_out, v_in = 0.0, float(gain[0]) - cost  # the video starts 'out': a block at the start pays its switch too
-    for i in range(1, n):
-        o_sw, i_sw = v_in - cost > v_out, v_out - cost > v_in
-        back[i] = (o_sw, i_sw)
-        v_out, v_in = (v_in - cost if o_sw else v_out), (v_out - cost if i_sw else v_in) + float(gain[i])
-    path = np.zeros(n, bool)
-    st = v_in > v_out
-    for i in range(n - 1, -1, -1):
-        path[i] = st
-        if i and back[i, int(st)]:
-            st = not st
-    return path
+def _to_segments(keep, cuts, s, duration):
+    """Runs of keep → (start, end) seconds: edges snapped to cuts, min length, padding."""
+    snap_d = int(s.snap_s * SAMPLE_FPS)
+    segs = []
+    for a, b in mask_to_runs(keep):
+        a, b = snap(a, cuts, snap_d), snap(b, cuts, snap_d)
+        if b - a < s.min_len_s * SAMPLE_FPS:
+            continue
+        t0 = max(0.0, a / SAMPLE_FPS - s.pad_s)
+        t1 = min(duration, b / SAMPLE_FPS + s.pad_s)
+        if segs and t0 <= segs[-1][1]:
+            segs[-1] = (segs[-1][0], max(segs[-1][1], t1))
+        else:
+            segs.append((t0, t1))
+    return [(round(a, 2), round(b, 2)) for a, b in segs]
 
 
 def decide(an, s, overrides=None):
@@ -819,55 +744,38 @@ def decide(an, s, overrides=None):
         'speech': hysteresis(curves['speech'], s.speech_level),
         'music': hysteresis(curves['music'], s.music_level),
     }
-    score_line = None
-    if s.decision == 'score':
-        parts = score_parts(an, s, logm, thr, still, win)
-        score = rolling_mean(combine_score(parts, s), win)
-        sthr = score_threshold(s.strictness)
-        curves['score'] = np.clip((score + SCORE_RANGE) / (2 * SCORE_RANGE) * 100.0, 0, 100)
-        score_line = float(np.clip((sthr + SCORE_RANGE) / (2 * SCORE_RANGE) * 100.0, 0, 100))
-        if 'dialog' in parts:
-            masks['speech'] = parts['dialog'] > 0.5  # what the score treats as dialog
-        keep = fill_gaps(hysteresis(score, sthr, band=SCORE_BAND), int(s.merge_gap_s * SAMPLE_FPS))
-    elif s.decision == 'blocks':
-        parts = score_parts(an, s, logm, thr, still, win)
-        ev = rolling_mean(block_evidence(parts, s), int(BLOCK_SMOOTH_S * SAMPLE_FPS))
-        offset = score_threshold(s.strictness) / 0.8 * 1.5  # strictness 0..100 → -1.5..1.5
-        fps = int(SAMPLE_FPS)
-        sec = -(-n // fps)
-        per_sec = np.pad(ev, (0, sec * fps - n), mode='edge').reshape(sec, fps).mean(axis=1)
-        keep = np.repeat(block_path(per_sec - offset, max(float(s.block_s), 0.0)), fps)[:n]
-        curves['score'] = np.clip((ev + BLOCK_RANGE) / (2 * BLOCK_RANGE) * 100.0, 0, 100)
-        score_line = float(np.clip((offset + BLOCK_RANGE) / (2 * BLOCK_RANGE) * 100.0, 0, 100))
-        if 'dialog' in parts:
-            masks['speech'] = parts['dialog'] > 0.5
-    else:
-        keep = np.zeros(n, bool)
-        if s.motion_keep:
-            keep |= masks['motion']
-        if s.vocal_keep:
-            keep |= masks['vocal']
-        if s.music_keep:
-            keep |= masks['music']
-        if s.speech_mode == 'keep':
-            keep |= masks['speech']
-        keep = fill_gaps(keep, int(s.merge_gap_s * SAMPLE_FPS))
-        if s.speech_mode == 'remove':
-            keep &= ~masks['speech']
+    keep = np.zeros(n, bool)
+    if s.motion_keep:
+        keep |= masks['motion']
+    if s.vocal_keep:
+        keep |= masks['vocal']
+    if s.music_keep:
+        keep |= masks['music']
+    if s.speech_mode == 'keep':
+        keep |= masks['speech']
+    keep = fill_gaps(keep, int(s.merge_gap_s * SAMPLE_FPS))
+    if s.speech_mode == 'remove':
+        keep &= ~masks['speech']
+    segs = _to_segments(keep, cuts, s, duration)
 
-    snap_d = int(s.snap_s * SAMPLE_FPS)
-    segs = []
-    for a, b in mask_to_runs(keep):
-        a, b = snap(a, cuts, snap_d), snap(b, cuts, snap_d)
-        if b - a < s.min_len_s * SAMPLE_FPS:
-            continue
-        t0 = max(0.0, a / SAMPLE_FPS - s.pad_s)
-        t1 = min(duration, b / SAMPLE_FPS + s.pad_s)
-        if segs and t0 <= segs[-1][1]:
-            segs[-1] = (segs[-1][0], max(segs[-1][1], t1))
-        else:
-            segs.append((t0, t1))
-    segs = [(round(a, 2), round(b, 2)) for a, b in segs]
+    region_line = None
+    if s.decision == 'extend' and n:
+        # Seeds: the finished classic pieces (min length applied, so no blip grows a scene)
+        seed = np.zeros(n, bool)
+        for a, b in segs:
+            seed[int(round(a * SAMPLE_FPS)):int(round(b * SAMPLE_FPS))] = True
+        ctx = rolling_mean(logm, int(EXTEND_SMOOTH_S * SAMPLE_FPS))
+        cthr = float(np.quantile(ctx, extend_level(s.strictness)))
+        region = ctx > cthr
+        if an['meta'].get('has_audio') and s.vocal_keep:
+            vocal_ctx = rolling_mean(an['vocal'], int(EXTEND_SMOOTH_S * SAMPLE_FPS)) * 100.0
+            region |= vocal_ctx > s.vocal_level * EXTEND_VOCAL
+        region = fill_gaps(region, int(s.scene_gap_s * SAMPLE_FPS))
+        keep = grow_to_regions(seed, region)
+        segs = _to_segments(keep, cuts, s, duration)
+        curves['region'] = np.clip((ctx - lo_v) * scale, 0, 100)
+        region_line = float(np.clip((cthr - lo_v) * scale, 0, 100))
+
     if overrides:
         segs = apply_overrides(segs, overrides, duration)
     kept = sum(b - a for a, b in segs)
@@ -875,7 +783,7 @@ def decide(an, s, overrides=None):
         'segments': segs, 'curves': curves, 'masks': masks, 'keep': keep, 'cuts': cuts,
         'auto_motion_level': auto_level, 'motion_level': level, 'overrides': list(overrides or []),
         'motion_line': float(np.clip((thr - lo_v) * scale, 0, 100)),  # threshold on the display scale
-        'score_line': score_line,  # score mode: threshold on the 0..100 score curve
+        'region_line': region_line,  # combined mode: where the 30 s motion still counts as action
         'stats': {'kept_sec': kept, 'duration': duration, 'share': kept / max(duration, 1e-6),
                   'segments': len(segs), 'cuts': int(len(cuts))},
     }
@@ -984,8 +892,9 @@ def main():
                     help='motion percentile 0..100 to count as action (default: automatic)')
     ap.add_argument('--no-vocal', action='store_true')
     ap.add_argument('--speech', choices=('ignore', 'keep', 'remove'), default='remove')
-    ap.add_argument('--decision', choices=('classic', 'score', 'blocks'), default='classic')
-    ap.add_argument('--strictness', type=float, default=50.0, help='score mode: 0..100')
+    ap.add_argument('--decision', choices=('classic', 'extend'), default='classic',
+                    help='extend: classic picks the scenes, each grows to the action around it')
+    ap.add_argument('--strictness', type=float, default=50.0, help='extend: 0 = grow far .. 100 = grow little')
     ap.add_argument('--export', default='', help='comma list of xml, edl, mp4')
     args = ap.parse_args()
 
