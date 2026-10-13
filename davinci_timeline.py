@@ -11,6 +11,7 @@ existing ones – nothing in the project is deleted or overwritten. Connection h
 import os
 import time
 
+from davinci_render import prepare_render
 from fast_scan import full_length_parts
 
 from davinci_api import (
@@ -97,12 +98,15 @@ def color_parts(timeline, keep_flags):
                 pass
 
 
-def load_into_timeline(video_path, segments, log=print, timeline_name=None, full_length=False, duration=None):
+def load_into_timeline(video_path, segments, log=print, timeline_name=None, full_length=False, duration=None,
+                       deliver=True, render_kbps=None, render_dir=None):
     """Create a timeline from the keep-segments (seconds, source time).
 
     full_length=False: only the segments, back to back.
     full_length=True: the whole video (duration in seconds, default: clip length), cut at every
     segment edge, kept parts green, the rest orange.
+    deliver=True also sets up the Deliver page: H.264 limited to render_kbps (None = derived from
+    the source), into render_dir (default: next to the video). Nothing is queued or rendered.
     Call from any thread. Returns (project name, timeline name, number of clips).
     """
     if not segments:
@@ -179,6 +183,12 @@ def load_into_timeline(video_path, segments, log=print, timeline_name=None, full
             log(f'Lege {len(segments)} Szenen in die Timeline „{name}“ …')
             n = len(append_segments(media_pool, clip, segments, fps, clip_frames))
         project.SetCurrentTimeline(timeline)
+        if deliver:
+            try:
+                preset, kbps = prepare_render(resolve, project, video_path, render_kbps, render_dir, width, height)
+                log(f'Deliver vorbereitet: {preset} (Video max. {kbps} kbit/s, Audio 128 kbit/s).')
+            except Exception as e:  # the timeline is what counts
+                log(f'Hinweis: Render-Einstellungen nicht gesetzt – {e}')
         try:
             resolve.OpenPage('edit')
         except Exception:

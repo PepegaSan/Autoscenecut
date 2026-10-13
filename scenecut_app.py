@@ -124,6 +124,7 @@ class App:
         self.out_dir = tk.StringVar(value=cfg.get('out_dir', ''))
         self.export_kind = tk.StringVar(value=cfg.get('export_kind', 'davinci'))
         self.timeline_mode = tk.StringVar(value=cfg.get('timeline_mode', 'cut'))
+        self.render_kbps = tk.StringVar(value=cfg.get('render_kbps', 'Auto'))
         self.preview_mute = tk.BooleanVar(value=bool(cfg.get('preview_mute', False)))
 
         root.title(APP_NAME)
@@ -141,8 +142,23 @@ class App:
         threading.Thread(target=self._worker, daemon=True).start()
         self._poll_id = root.after(100, self._poll)
         root.protocol('WM_DELETE_WINDOW', self._on_close)
+        self._restore_session(cfg.get('videos') or [], cfg.get('current'))
         for arg in sys.argv[1:]:
             self.add_paths([arg])
+
+    def _restore_session(self, videos, current):
+        """Reopen the videos of the last session that still exist; cached ones load instantly."""
+        found = [p for p in videos if os.path.isfile(p)]
+        if found:
+            self.add_paths(found)
+            it = next((it for it in self.items if it.path == current), None)
+            if it is not None:
+                self.tree.selection_set(str(id(it)))
+                self.tree.see(str(id(it)))
+        missing = len(videos) - len(found)
+        if found or missing:
+            msg = f'{len(found)} Video(s) aus der letzten Sitzung geöffnet'
+            self.status_var.set(msg + (f', {missing} nicht mehr vorhanden.' if missing else '.'))
 
     def _register_drop(self, widget):
         """Drop target on every widget, so dropping works anywhere in the window."""
@@ -166,6 +182,10 @@ class App:
     def _save_cfg(self):
         data = {'settings': self.s.to_dict(), 'out_dir': self.out_dir.get(),
                 'export_kind': self.export_kind.get(), 'timeline_mode': self.timeline_mode.get(),
+                'render_kbps': self.render_kbps.get(),
+                # Session: reopened on the next start (analysis + corrections come from the cache)
+                'videos': [it.path for it in self.items],
+                'current': self.current.path if self.current is not None else None,
                 'preview_mute': bool(self.preview_mute.get()),
                 'geometry': self.root.geometry()}
         try:
@@ -202,6 +222,15 @@ class App:
                foreground=[('disabled', C['muted'])])
         st.configure('Accent.TButton', background=C['accent_dim'], foreground='#ffffff', font=FONT_B)
         st.map('Accent.TButton', background=[('active', C['accent']), ('disabled', C['panel'])])
+        st.configure('TCombobox', fieldbackground=C['panel2'], background=C['panel2'], foreground=C['text'],
+                     arrowcolor=C['text'], insertcolor=C['text'], selectbackground=C['accent_dim'],
+                     selectforeground='#ffffff', lightcolor=C['panel2'], darkcolor=C['panel2'], padding=(6, 3))
+        st.map('TCombobox', fieldbackground=[('disabled', C['panel'])], background=[('active', C['border'])],
+               foreground=[('disabled', C['muted'])], arrowcolor=[('disabled', C['muted'])])
+        # Drop-down list of the combobox is a plain Tk listbox
+        for opt, val in (('background', C['panel2']), ('foreground', C['text']),
+                         ('selectBackground', C['accent_dim']), ('selectForeground', '#ffffff')):
+            self.root.option_add(f'*TCombobox*Listbox.{opt}', val)
         st.configure('Horizontal.TScale', background=C['panel'], troughcolor=C['panel2'], sliderthickness=16)
         # Cards: one block per category, so options and explanations clearly belong to their slider
         st.configure('Card.TFrame', background=C['panel2'])
@@ -273,12 +302,23 @@ class App:
             rb = ttk.Radiobutton(ex, text=text, value=val, variable=self.timeline_mode, command=self._save_cfg)
             rb.grid(row=6 + i, column=0, sticky='w', pady=1)
             self.mode_radios.append(rb)
+        br = ttk.Frame(ex, style='Panel.TFrame')
+        br.grid(row=8, column=0, sticky='w', pady=(10, 0))
+        ttk.Label(br, text='Max. Bitrate', style='Panel.TLabel', font=FONT_B).pack(side='left')
+        self.kbps_box = ttk.Combobox(br, textvariable=self.render_kbps, width=7,
+                                     values=('Auto', '600', '800', '1000', '1500', '2500', '4000', 'Aus'))
+        self.kbps_box.pack(side='left', padx=6)
+        self.kbps_box.bind('<<ComboboxSelected>>', lambda _e: self._save_cfg())
+        self.kbps_box.bind('<FocusOut>', lambda _e: self._save_cfg())
+        ttk.Label(br, text='kbit/s  (Auto · Aus · Zahl)', style='Muted.TLabel').pack(side='left')
+        Tooltip(self.kbps_box, 'Richtet DaVincis Deliver-Seite ein (H.264, Audio 128 kbit/s). '
+                               'Auto = etwa die Qualität der Quelle. Aus = Deliver-Seite nicht anfassen.')
         self.target_title = ttk.Label(ex, text='Ziel', style='Panel.TLabel', font=FONT_B)
-        self.target_title.grid(row=8, column=0, sticky='w', pady=(10, 0))
+        self.target_title.grid(row=9, column=0, sticky='w', pady=(10, 0))
         self.out_label = ttk.Label(ex, text='', style='Muted.TLabel', wraplength=290)
-        self.out_label.grid(row=9, column=0, sticky='w')
+        self.out_label.grid(row=10, column=0, sticky='w')
         of = ttk.Frame(ex, style='Panel.TFrame')
-        of.grid(row=10, column=0, sticky='w', pady=(4, 0))
+        of.grid(row=11, column=0, sticky='w', pady=(4, 0))
         self.btn_out_pick = ttk.Button(of, text='Ordner wählen …', command=self.ask_out_dir)
         self.btn_out_pick.pack(side='left')
         self.btn_out_reset = ttk.Button(of, text='Neben dem Video', command=lambda: self._set_out(''))
@@ -287,9 +327,9 @@ class App:
 
         self.btn_export = ttk.Button(ex, text='Dieses Video exportieren', style='Accent.TButton',
                                      command=lambda: self.start_export(all_items=False))
-        self.btn_export.grid(row=11, column=0, sticky='ew', pady=(14, 0))
+        self.btn_export.grid(row=12, column=0, sticky='ew', pady=(14, 0))
         act = ttk.Frame(ex, style='Panel.TFrame')
-        act.grid(row=12, column=0, sticky='ew', pady=(6, 0))
+        act.grid(row=13, column=0, sticky='ew', pady=(6, 0))
         act.columnconfigure((0, 1), weight=1)
         self.btn_export_all = ttk.Button(act, text='Alle exportieren', command=lambda: self.start_export(all_items=True))
         self.btn_export_all.grid(row=0, column=0, sticky='ew')
@@ -555,6 +595,8 @@ class App:
             self.status_var.set('Keine Videodateien erkannt.')
         if added and self.current is None:
             self.tree.selection_set(str(id(added[0])))
+        if added:
+            self._save_cfg()
         self._update_buttons()
 
     def remove_selected(self):
@@ -567,6 +609,7 @@ class App:
         if self.current is it:
             self.current = None
             self._show_item(None)
+        self._save_cfg()
         self._update_buttons()
 
     def retry_selected(self):
@@ -584,6 +627,7 @@ class App:
 
     def _on_select(self, _e=None):
         self._show_item(self._selected())
+        self._save_cfg()
 
     def _show_item(self, it):
         self.current = it
@@ -942,7 +986,7 @@ class App:
                 if kind == 'analyze':
                     self._run_analyze(job[1])
                 elif kind == 'export':
-                    self._run_export(job[1], job[2], job[3], job[4])
+                    self._run_export(*job[1:])
             except Exception as e:  # never kill the worker
                 self.events.put(('error', job, str(e)))
 
@@ -968,7 +1012,7 @@ class App:
             it.error = str(e)
         self.events.put(('item', it))
 
-    def _run_export(self, items, kind, out_dir, full_length=False):
+    def _run_export(self, items, kind, out_dir, full_length=False, render_kbps=None):
         self.cancel.clear()
         written = []
         loaded = []
@@ -985,7 +1029,8 @@ class App:
                     from davinci_timeline import load_into_timeline  # Resolve API only when needed
                     _proj, tl, _n = load_into_timeline(
                         it.path, res['segments'], log=lambda m: self.events.put(('status', prefix + m)),
-                        full_length=full_length, duration=it.an['meta']['duration'])
+                        full_length=full_length, duration=it.an['meta']['duration'],
+                        deliver=render_kbps != 0, render_kbps=render_kbps, render_dir=out_dir or None)
                     loaded.append(tl)
                     self.events.put(('progress', k / len(items), prefix + f'In DaVinci geladen: {tl}'))
                     continue
@@ -1060,23 +1105,23 @@ class App:
 
     def _export_kind_changed(self, save=True):
         davinci = self.export_kind.get() == 'davinci'
-        for b in (self.btn_out_pick, self.btn_out_reset):
-            b.state(['disabled'] if davinci else ['!disabled'])
+        self.kbps_box.state(['!disabled'] if davinci else ['disabled'])
         # A full-length MP4 would just be the original
         for rb in self.mode_radios:
             rb.state(['disabled'] if self.export_kind.get() == 'mp4' else ['!disabled'])
         self.btn_export.configure(text='In DaVinci laden' if davinci else 'Dieses Video exportieren')
         self.btn_export_all.configure(text='Alle in DaVinci laden' if davinci else 'Alle exportieren')
-        if davinci:
-            self.out_label.configure(text='Timeline im geöffneten DaVinci-Projekt (Resolve wird bei Bedarf gestartet)')
-        else:
-            self._set_out(self.out_dir.get(), save=False)
+        self._set_out(self.out_dir.get(), save=False)
         if save:
             self._save_cfg()
 
     def _set_out(self, path, save=True):
         self.out_dir.set(path)
-        self.out_label.configure(text=path or 'neben dem jeweiligen Video')
+        text = path or 'neben dem jeweiligen Video'
+        if self.export_kind.get() == 'davinci':
+            text = ('Timeline im geöffneten DaVinci-Projekt (Resolve wird bei Bedarf gestartet), '
+                    'Render-Ziel: ' + text)
+        self.out_label.configure(text=text)
         if save:
             self._save_cfg()
 
@@ -1090,9 +1135,22 @@ class App:
             ([self.current] if self.current is not None and self.current.an is not None else [])
         if not items:
             return
+        # Bitrate for DaVinci's Deliver page: None = from the source, 0 = leave Deliver alone
+        val = self.render_kbps.get().strip().lower()
+        if val in ('', 'auto'):
+            kbps = None
+        elif val == 'aus':
+            kbps = 0
+        elif val.isdigit() and int(val) >= 100:
+            kbps = int(val)
+        else:
+            messagebox.showerror(APP_NAME, 'Max. Bitrate: Auto, Aus oder eine Zahl in kbit/s (z. B. 1000).')
+            return
+        self._save_cfg()
         self.busy_export = True
         self._update_buttons()
-        self.jobs.put(('export', items, self.export_kind.get(), self.out_dir.get(), self.timeline_mode.get() == 'full'))
+        self.jobs.put(('export', items, self.export_kind.get(), self.out_dir.get(), self.timeline_mode.get() == 'full',
+                       kbps))
 
     def cancel_current(self):
         self.cancel.set()

@@ -172,6 +172,12 @@ def _patch(project, resolve, fps=29.97002997002997, wh=(1280, 720)):
     dt.connect_resolve = lambda **kw: (resolve, project, project.pool, project.pool.root)
     dt.probe_source_fps = lambda path: fps
     dt.probe_video_wh = lambda path: wh
+    project.render_calls = []
+
+    def fake_prepare(_resolve, proj, path, kbps, target_dir, w, h):
+        proj.render_calls.append((path, kbps, target_dir, w, h))
+        return f'Scenecut H264 {kbps or 1000}k', kbps or 1000
+    dt.prepare_render = fake_prepare
 
 
 def _video(tmp_path: Path) -> Path:
@@ -234,6 +240,27 @@ def test_full_length(tmp_path: Path):
     assert [i.color for i in tl.track['video']] == want and [i.color for i in tl.track['audio']] == want
 
 
+def test_deliver_setup(tmp_path: Path):
+    vid = _video(tmp_path)
+    project, resolve = FakeProject('Edit'), FakeResolve()
+    _patch(project, resolve, wh=(852, 478))
+    logs = []
+    dt.load_into_timeline(str(vid), [(0.0, 5.0)], log=logs.append, render_kbps=800, render_dir='E:/out')
+    assert project.render_calls == [(str(vid), 800, 'E:/out', 852, 478)], project.render_calls
+    assert any('Scenecut H264 800k' in m for m in logs), logs
+
+    def broken(*_a):
+        raise RuntimeError('no preset')
+    dt.prepare_render = broken
+    logs.clear()
+    _p, _name, n = dt.load_into_timeline(str(vid), [(0.0, 5.0)], log=logs.append)
+    assert n == 1 and any('Render-Einstellungen nicht gesetzt' in m for m in logs), 'timeline must survive'
+
+    _patch(project, resolve)
+    dt.load_into_timeline(str(vid), [(0.0, 5.0)], log=lambda m: None, deliver=False)
+    assert project.render_calls == [], 'deliver=False must leave the Deliver page alone'
+
+
 def test_no_segments(tmp_path: Path):
     try:
         dt.load_into_timeline(str(_video(tmp_path)), [])
@@ -245,7 +272,7 @@ def test_no_segments(tmp_path: Path):
 def main() -> int:
     import shutil
     tests = [test_empty_project, test_existing_project_reuses_clip_and_keeps_timelines, test_full_length,
-             test_no_segments]
+             test_deliver_setup, test_no_segments]
     work = _ROOT / 'output' / '_davinci_timeline_test'
     failed = 0
     for fn in tests:
