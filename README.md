@@ -46,7 +46,9 @@ Manual alternative: `pip install -r requirements.txt`, then `python scenecut_app
    - Timeline content: only the kept parts, or the whole video cut at every scene edge
      (direct load colours kept parts green, the rest orange)
 
-Settings are remembered in `scenecut_settings.json` next to the app.
+Every video remembers its own sliders (a video opened for the first time starts with those of the
+video shown before); *Auf alle Videos anwenden* copies them to the whole list. Export uses each
+video's own settings. The app's own settings are in `scenecut_settings.json` next to it.
 
 ## How it decides
 

@@ -647,6 +647,16 @@ def load_labels(video, cache_dir=None):
     return d
 
 
+def save_video_settings(video, s, cache_dir=None):
+    """The sliders as last set for this one video."""
+    _write_json(_side_path(video, 'settings.json', cache_dir), s.to_dict())
+
+
+def load_video_settings(video, cache_dir=None):
+    d = _read_json(_side_path(video, 'settings.json', cache_dir))
+    return Settings.from_dict(d) if isinstance(d, dict) else None
+
+
 def load_overrides(video, cache_dir=None):
     try:
         with open(_overrides_path(video, cache_dir), encoding='utf-8') as f:

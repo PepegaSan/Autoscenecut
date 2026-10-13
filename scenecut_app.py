@@ -107,6 +107,7 @@ class Item:
         self.res = None
         self.error = ''
         self.overrides = []  # manual corrections: (start, end, 'keep' | 'drop')
+        self.s = None  # own slider settings (fs.Settings), set when first shown
 
 
 class App:
@@ -400,6 +401,10 @@ class App:
             b.pack(side='left', padx=(0, 4))
             Tooltip(b, tip)
             self.preset_btns[name] = b
+        b = ttk.Button(presets, text='Auf alle Videos anwenden', style='Preset.TButton', command=self.apply_to_all)
+        b.pack(side='left', padx=(16, 0))
+        Tooltip(b, 'Jedes Video merkt sich seine eigenen Regler. Das hier überträgt die Regler dieses Videos '
+                   'auf alle Videos in der Liste (eigene Korrekturen bleiben, wie sie sind).')
 
         nb = ttk.Notebook(right)
         nb.grid(row=6, column=0, sticky='nsew')
@@ -534,12 +539,34 @@ class App:
     def apply_preset(self, name):
         vals, _tip = PRESETS[name]
         mode = {k: getattr(self.s, k) for k in MODE_KEYS}
-        self.s = fs.Settings.from_dict({**fs.Settings().to_dict(), **vals, **mode})
+        self._use_settings(fs.Settings.from_dict({**fs.Settings().to_dict(), **vals, **mode}))
+        self._recompute(save_video=True)
+        self.status_var.set(f'Voreinstellung „{name}“ übernommen')
+
+    def _use_settings(self, s):
+        """Show s in the sliders; it becomes the selected video's own settings."""
+        self.s = s
+        if self.current is not None:
+            self.current.s = s
         self._loading = True
         self._apply_settings_to_widgets()
         self._loading = False
-        self._recompute()
-        self.status_var.set(f'Voreinstellung „{name}“ übernommen')
+
+    def _settings_of(self, it):
+        if it.s is None:
+            it.s = fs.load_video_settings(it.path) or fs.Settings.from_dict(self.s.to_dict())
+        return it.s
+
+    def apply_to_all(self):
+        """Copy the selected video's settings to every video in the list."""
+        if self.current is None:
+            return
+        for it in self.items:
+            if it is not self.current:
+                it.s = fs.Settings.from_dict(self.s.to_dict())
+                it.res = None
+                fs.save_video_settings(it.path, it.s)
+        self.status_var.set(f'Einstellungen auf alle {len(self.items)} Videos übertragen')
 
     def _update_presets(self):
         cur = self.s.to_dict()
@@ -586,11 +613,14 @@ class App:
         self._sync_motion_widgets()
         if self._redraw_after:
             self.root.after_cancel(self._redraw_after)
-        self._redraw_after = self.root.after(60, self._recompute)
+        self._redraw_after = self.root.after(60, lambda: self._recompute(save_video=True))
 
-    def _recompute(self):
+    def _recompute(self, save_video=False):
+        """save_video: the sliders changed – remember them for the selected video."""
         self._redraw_after = None
         it = self.current
+        if save_video and it is not None:
+            fs.save_video_settings(it.path, self.s)
         if it is not None and it.an is not None:
             it.res = fs.decide(it.an, self.s, it.overrides)
             if self.s.decision != 'classic':
@@ -686,6 +716,9 @@ class App:
             self.title_var.set('Kein Video ausgewählt')
             self.info_var.set('Zieh ein Video ins Fenster, um zu starten.')
         else:
+            # Its own saved sliders, or (first time) those of the video shown before
+            if self._settings_of(it) is not self.s:
+                self._use_settings(it.s)
             self.title_var.set(it.name)
             self._update_info(it)
             if it.an is not None:
@@ -1091,8 +1124,8 @@ class App:
         self.cancel.clear()
         written = []
         loaded = []
-        for k, it in enumerate(items, 1):
-            res = fs.decide(it.an, self.s, it.overrides)
+        for k, (it, settings) in enumerate(items, 1):
+            res = fs.decide(it.an, settings, it.overrides)
             if not res['segments']:
                 self.events.put(('status', f'{it.name}: nichts zu behalten – übersprungen'))
                 continue
@@ -1150,7 +1183,7 @@ class App:
         if rec is not None:
             exported, ref = rec['segments'], f"dem Export vom {rec.get('time', '?')}"
         else:
-            res = it.res or fs.decide(it.an, self.s, it.overrides)
+            res = it.res or fs.decide(it.an, self._settings_of(it), it.overrides)
             exported, ref = res['segments'], 'dem aktuellen Vorschlag (kein Export gespeichert)'
         changes = fs.edit_to_overrides(exported, final)
         drops = [c for c in changes if c[2] == 'drop']
@@ -1287,6 +1320,8 @@ class App:
         self._save_cfg()
         self.busy_export = True
         self._update_buttons()
+        # Every video with its own sliders (snapshot: the sliders may move while exporting)
+        items = [(it, fs.Settings.from_dict(self._settings_of(it).to_dict())) for it in items]
         self.jobs.put(('export', items, self.export_kind.get(), self.out_dir.get(), self.timeline_mode.get() == 'full',
                        kbps))
 

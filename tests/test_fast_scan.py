@@ -178,6 +178,9 @@ def test_labels_and_export_record(tmp_path: Path):
     fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=True, source='davinci', cache_dir=c)
     lab = fs.load_labels(str(vid), c)
     assert lab['final'] == [(0.0, 3.0)] and lab['reviewed'] is True, lab
+    assert fs.load_video_settings(str(vid), c) is None
+    fs.save_video_settings(str(vid), fs.Settings(decision='extend', strictness=70), cache_dir=c)
+    assert fs.load_video_settings(str(vid), c) == fs.Settings(decision='extend', strictness=70)
 
 
 def test_pool_embeddings():
