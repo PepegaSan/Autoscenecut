@@ -30,7 +30,7 @@ C = {
     'bg': '#0f1117', 'panel': '#171a22', 'panel2': '#1e222c', 'border': '#2b3040',
     'text': '#e8eaf0', 'muted': '#8a90a2', 'accent': '#00c8ff', 'accent_dim': '#0a5f7a',
     'keep': '#3ccf7a', 'keep_bg': '#1f4d35', 'motion': '#00c8ff', 'motion_off': '#153646', 'vocal': '#ffb74d', 'speech': '#c792ea', 'music': '#7f8cff',
-    'cut': '#4a5068', 'error': '#ff8a80', 'drop': '#5a2a2a',
+    'cut': '#4a5068', 'error': '#ff8a80', 'drop': '#5a2a2a', 'new': '#ffe066', 'gone': '#b0b6c8',
 }
 FONT = ('Segoe UI', 10)
 FONT_B = ('Segoe UI Semibold', 10)
@@ -47,6 +47,8 @@ PRESETS = {
                    'merge_gap_s': 8.0, 'pad_s': 1.0},
                   'Fast alles mit etwas Bewegung oder Stimme bleibt, nur klarer Dialog fliegt raus.'),
 }
+# Chosen separately from the presets: a preset never switches the decision mode
+MODE_KEYS = ('decision', 'strictness', 'block_s')
 
 
 def _app_dir():
@@ -335,6 +337,12 @@ class App:
         self.btn_export_all.grid(row=0, column=0, sticky='ew')
         self.btn_open = ttk.Button(act, text='Ordner öffnen', command=self._open_last, state='disabled')
         self.btn_open.grid(row=0, column=1, sticky='ew', padx=(6, 0))
+        self.btn_import = ttk.Button(ex, text='Schnitt aus DaVinci übernehmen', command=self.start_import)
+        self.btn_import.grid(row=14, column=0, sticky='ew', pady=(6, 0))
+        Tooltip(self.btn_import, 'Liest deine fertige Timeline dieses Videos aus DaVinci (nur lesen). Was du dort '
+                                 'gelöscht, gekürzt oder wieder reingeholt hast, wird hier zur Korrektur – und zum '
+                                 'Lernmaterial. Es zählt jeder Clip, der noch in der Timeline liegt (egal welche '
+                                 'Farbe, auch halbierte); Rausgeschnittenes und Deaktiviertes gilt als raus.')
         self.last_export = None
         self._export_kind_changed(save=False)
 
@@ -364,6 +372,12 @@ class App:
                             ('#ffffff', 'weiß umrandet = selbst behalten'), (C['error'], 'rot = selbst raus')):
             tk.Label(hint_row, text='■', fg=color, bg=C['panel'], font=FONT).pack(side='left')
             ttk.Label(hint_row, text=text + '    ', style='Muted.TLabel').pack(side='left')
+        # Only in score mode: the bars under "Bleibt"
+        self.cmp_legend = []
+        for color, text in ((C['new'], 'gelber Strich = neu ggü. klassisch'), (C['gone'], 'grauer = fällt weg')):
+            sq = tk.Label(hint_row, text='▬', fg=color, bg=C['panel'], font=FONT)
+            lbl = ttk.Label(hint_row, text=text + '    ', style='Muted.TLabel')
+            self.cmp_legend.append((sq, lbl))
         how = ttk.Frame(right, style='Panel.TFrame')
         how.grid(row=4, column=0, sticky='ew')
         ttk.Label(how, text='Klick = ab dort abspielen  ·  Ziehen / Rechtsklick = selbst behalten oder rausschneiden',
@@ -398,11 +412,35 @@ class App:
         fine.columnconfigure(0, weight=1)
         self.v = {}
 
+        # How the categories are combined
+        self.v['decision'] = tk.StringVar()
+        self.v['strictness'] = tk.DoubleVar()
+        card = self._card(box, 0)
+        ttk.Label(card, text='Entscheidung', style='Card.TLabel').grid(row=0, column=0, sticky='w', padx=(2, 0))
+        modes = ttk.Frame(card, style='Card.TFrame')
+        modes.grid(row=1, column=0, sticky='w', padx=(20, 0))
+        for val, text, tip in (
+                ('classic', 'klassisch', 'Bewegung ODER Stimme reicht zum Behalten, jeder Dialog-Treffer schneidet raus.'),
+                ('score', 'kombiniert', 'Alles zählt zusammen: Bewegung, Stimme und Lautstärke dafür, anhaltender '
+                                        'Dialog und Musik dagegen. Leise Bewegung fällt eher raus, einzelne '
+                                        '„Sprache“-Treffer mitten in Action nicht mehr.'),
+                ('blocks', 'Action-Blöcke', 'Entscheidet über ganze zusammenhängende Abschnitte statt Sekunde für '
+                                            'Sekunde – ruhige Momente mitten in der Action bleiben drin. Stimme '
+                                            'zählt am meisten (über 30 s gemittelt). Gewichte aus deinem ersten '
+                                            'komplett geprüften Video, noch vorläufig.')):
+            rb = ttk.Radiobutton(modes, text=text, value=val, variable=self.v['decision'], style='Card.TRadiobutton',
+                                 command=self._changed)
+            rb.pack(side='left', padx=(0, 6))
+            Tooltip(rb, tip)
+        self.strict_scale = self._scale(card, 0, 'strictness', 0, 100, col=1, card=True)
+        self.strict_hint = ttk.Label(card, text='', style='CardMuted.TLabel')
+        self.strict_hint.grid(row=1, column=1, columnspan=2, sticky='w', padx=(12, 0))
+
         # One card per category: title + options left, slider + its explanation right
         self.v['motion_keep'] = tk.BooleanVar()
         self.v['motion_auto'] = tk.BooleanVar()
         self.v['motion_level'] = tk.DoubleVar()
-        card = self._card(box, 0)
+        card = self._card(box, 1)
         ttk.Checkbutton(card, text='Bewegung / Action', variable=self.v['motion_keep'], style='Card.TCheckbutton',
                         command=self._changed).grid(row=0, column=0, sticky='w')
         ttk.Checkbutton(card, text='Schwelle automatisch', variable=self.v['motion_auto'],
@@ -414,7 +452,7 @@ class App:
 
         self.v['vocal_keep'] = tk.BooleanVar()
         self.v['vocal_level'] = tk.DoubleVar()
-        card = self._card(box, 1)
+        card = self._card(box, 2)
         ttk.Checkbutton(card, text='Stimme', variable=self.v['vocal_keep'], style='Card.TCheckbutton',
                         command=self._changed).grid(row=0, column=0, sticky='w')
         ttk.Label(card, text='Stöhnen, Atmen, Schreien', style='CardMuted.TLabel').grid(
@@ -425,7 +463,7 @@ class App:
 
         self.v['speech_mode'] = tk.StringVar()
         self.v['speech_level'] = tk.DoubleVar()
-        card = self._card(box, 2)
+        card = self._card(box, 3)
         ttk.Label(card, text='Dialog / Sprache', style='Card.TLabel').grid(row=0, column=0, sticky='w', padx=(2, 0))
         modes = ttk.Frame(card, style='Card.TFrame')
         modes.grid(row=1, column=0, sticky='w', padx=(20, 0))
@@ -438,7 +476,7 @@ class App:
 
         self.v['music_keep'] = tk.BooleanVar()
         self.v['music_level'] = tk.DoubleVar()
-        card = self._card(box, 3)
+        card = self._card(box, 4)
         ttk.Checkbutton(card, text='Musik', variable=self.v['music_keep'], style='Card.TCheckbutton',
                         command=self._changed).grid(row=0, column=0, sticky='w')
         self._scale(card, 0, 'music_level', 5, 90, col=1, card=True)
@@ -451,6 +489,8 @@ class App:
                  'Pausen bis zu dieser Länge zwischen zwei Szenen werden mitgenommen.'),
                 ('pad_s', 'Rand an Schnitten', 0, 5, 's', 'Etwas Luft vor und nach jeder Szene.'),
                 ('smooth_s', 'Glättung', 0.5, 8, 's', 'Höher = ruhigere Entscheidung, weniger Zerstückelung.'),
+                ('block_s', 'Blockgröße', 5, 120, 's',
+                 'Nur Action-Blöcke: höher = weniger, längere Blöcke, auch längere Pausen bleiben drin.'),
         )):
             self.v[key] = tk.DoubleVar()
             card = self._card(fine, i)
@@ -490,13 +530,14 @@ class App:
     def _card(self, parent, row):
         card = ttk.Frame(parent, style='Card.TFrame', padding=(10, 6))
         card.grid(row=row, column=0, sticky='ew', pady=(0, 6))
-        card.columnconfigure(0, minsize=280)  # wide enough for the dialog radios: sliders line up
+        card.columnconfigure(0, minsize=300)  # wide enough for the decision radios: sliders line up
         card.columnconfigure(1, weight=1)
         return card
 
     def apply_preset(self, name):
         vals, _tip = PRESETS[name]
-        self.s = fs.Settings.from_dict({**fs.Settings().to_dict(), **vals})
+        mode = {k: getattr(self.s, k) for k in MODE_KEYS}
+        self.s = fs.Settings.from_dict({**fs.Settings().to_dict(), **vals, **mode})
         self._loading = True
         self._apply_settings_to_widgets()
         self._loading = False
@@ -506,7 +547,7 @@ class App:
     def _update_presets(self):
         cur = self.s.to_dict()
         for name, (vals, _tip) in PRESETS.items():
-            want = {**fs.Settings().to_dict(), **vals}
+            want = {k: v for k, v in {**fs.Settings().to_dict(), **vals}.items() if k not in MODE_KEYS}
             same = all(abs(cur[k] - v) < 0.05 if isinstance(v, float) else cur[k] == v for k, v in want.items())
             self.preset_btns[name].configure(style='PresetOn.TButton' if same else 'Preset.TButton')
 
@@ -515,7 +556,8 @@ class App:
     def _apply_settings_to_widgets(self):
         s = self.s
         for k in ('motion_keep', 'vocal_keep', 'music_keep', 'speech_mode', 'vocal_level', 'speech_level',
-                  'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s'):
+                  'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s', 'decision', 'strictness',
+                  'block_s'):
             self.v[k].set(getattr(s, k))
         self.v['motion_auto'].set(s.motion_level < 0)
         self.v['motion_level'].set(s.motion_level if s.motion_level >= 0 else 50)
@@ -526,13 +568,19 @@ class App:
         for k in ('motion_keep', 'vocal_keep', 'music_keep'):
             setattr(s, k, bool(self.v[k].get()))
         s.speech_mode = self.v['speech_mode'].get()
-        for k in ('vocal_level', 'speech_level', 'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s'):
+        s.decision = self.v['decision'].get()
+        for k in ('vocal_level', 'speech_level', 'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s',
+                  'strictness', 'block_s'):
             setattr(s, k, round(float(self.v[k].get()), 1))
         s.motion_level = -1.0 if self.v['motion_auto'].get() else round(float(self.v['motion_level'].get()), 1)
 
     def _sync_motion_widgets(self):
         auto = self.v['motion_auto'].get()
         self.motion_scale.state(['disabled'] if auto else ['!disabled'])
+        score = self.v['decision'].get() != 'classic'
+        self.strict_scale.state(['!disabled'] if score else ['disabled'])
+        self.strict_hint.configure(text='höher = strenger, nur die klarsten Stellen bleiben' if score else
+                                   'Strenge gilt nur für „kombiniert“ und „Action-Blöcke“')
 
     def _changed(self):
         if self._loading:
@@ -548,6 +596,12 @@ class App:
         it = self.current
         if it is not None and it.an is not None:
             it.res = fs.decide(it.an, self.s, it.overrides)
+            if self.s.decision != 'classic':
+                # What changes against the classic decision: the places worth a look
+                classic = fs.Settings.from_dict({**self.s.to_dict(), 'decision': 'classic'})
+                old = fs.decide(it.an, classic, it.overrides)['segments']
+                it.res['vs_classic'] = (fs.spans_minus(it.res['segments'], old, 0.5),
+                                        fs.spans_minus(old, it.res['segments'], 0.5))
             if self.s.motion_level < 0:
                 self._loading = True
                 self.v['motion_level'].set(round(it.res['auto_motion_level']))
@@ -754,21 +808,27 @@ class App:
                 cv.create_rectangle(xa, y0, max(xb, xa + 2), y1, outline='#ffffff', width=2)
             else:
                 cv.create_rectangle(xa, y0, max(xb, xa + 2), y1, fill=C['drop'], outline=C['error'], width=1)
+        # Score mode: bar under the lane where it differs from the classic decision
+        for spans_, color in zip(res.get('vs_classic', ()), (C['new'], C['gone'])):
+            for a, b in spans_:
+                xa, xb = x0 + a / dur * (x1 - x0), x0 + b / dur * (x1 - x0)
+                cv.create_rectangle(xa, y1 + 1, max(xb, xa + 2), y1 + 5, fill=color, outline='')
         label('keep', 'Bleibt', True)
 
-        # Bewegung: bright where the video stays, dimmed where it is cut out
+        # Bewegung (score mode: the combined score): bright where the video stays, dimmed where cut out
         y0, y1 = lanes['motion']
         lane_bg(y0, y1)
-        mot = per_px(res['curves']['motion'], 'mean')
-        on = s.motion_keep
+        score_mode = res.get('score_line') is not None
+        mot = per_px(res['curves']['score' if score_mode else 'motion'], 'mean')
+        on = s.motion_keep or score_mode
         for i in range(cols):
             yv = y1 - min(max(mot[i], 0), 100) / 100 * (y1 - y0)
             col = (C['motion'] if kept[i] else C['motion_off']) if on else (C['muted'] if kept[i] else C['border'])
             cv.create_line(x0 + i, y1, x0 + i, yv, fill=col)
         if on:
-            ly = y1 - res['motion_line'] / 100 * (y1 - y0)
+            ly = y1 - (res['score_line'] if score_mode else res['motion_line']) / 100 * (y1 - y0)
             cv.create_line(x0, ly, x1, ly, fill=C['text'], dash=(4, 3))
-        label('motion', 'Bewegung', on)
+        label('motion', 'Score' if score_mode else 'Bewegung', on)
 
         # Sound lanes
         modes = {'vocal': ('Stimme', s.vocal_keep), 'music': ('Musik', s.music_keep),
@@ -829,7 +889,15 @@ class App:
         i = min(int(t * fs.SAMPLE_FPS), len(it.res['keep']) - 1)
         c = it.res['curves']
         stays = any(a <= t < b for a, b in it.res['segments'])
-        txt = f"{fmt_time(t)}  {'bleibt' if stays else 'fliegt raus'}   Bewegung {c['motion'][i]:.0f}"
+        txt = f"{fmt_time(t)}  {'bleibt' if stays else 'fliegt raus'}"
+        new, gone = it.res.get('vs_classic', ((), ()))
+        if any(a <= t < b for a, b in new):
+            txt += ' (neu ggü. klassisch)'
+        elif any(a <= t < b for a, b in gone):
+            txt += ' (klassisch: bleibt)'
+        if 'score' in c:
+            txt += f"   Score {c['score'][i]:.0f}"
+        txt += f"   Bewegung {c['motion'][i]:.0f}"
         if it.an['meta'].get('has_audio'):
             txt += f"  Stimme {c['vocal'][i]:.0f}  Sprache {c['speech'][i]:.0f}"
         h = self.canvas.winfo_height()
@@ -913,19 +981,7 @@ class App:
         it = self.current
         if it is None:
             return
-        trimmed = []
-        for o_a, o_b, o_m in it.overrides:
-            # Older corrections give way inside [a, b)
-            if o_b <= a or o_a >= b:
-                trimmed.append((o_a, o_b, o_m))
-                continue
-            if o_a < a:
-                trimmed.append((o_a, a, o_m))
-            if o_b > b:
-                trimmed.append((b, o_b, o_m))
-        if mode is not None:
-            trimmed.append((round(a, 2), round(b, 2), mode))
-        it.overrides = trimmed
+        it.overrides = fs.set_override(it.overrides, a, b, mode)
         fs.save_overrides(it.path, it.overrides)
         self._recompute()
         what = {'keep': 'bleibt immer drin', 'drop': 'fliegt immer raus', None: 'wieder automatisch'}[mode]
@@ -970,8 +1026,20 @@ class App:
             return
         st = it.res['stats']
         own = f" · {len(it.overrides)} selbst festgelegt" if it.overrides else ''
+        cmp = ''
+        if 'vs_classic' in it.res:
+            new, gone = (sum(b - a for a, b in sp) for sp in it.res['vs_classic'])
+            cmp = f' · ggü. klassisch +{fmt_time(new)} / −{fmt_time(gone)}'
         self.summary_var.set(f"Behalten: {fmt_time(st['kept_sec'])} von {fmt_time(st['duration'])} "
-                             f"({st['share'] * 100:.0f} %) · {st['segments']} {'Szene' if st['segments'] == 1 else 'Szenen'}{own}")
+                             f"({st['share'] * 100:.0f} %) · {st['segments']} {'Szene' if st['segments'] == 1 else 'Szenen'}"
+                             f"{own}{cmp}")
+        for sq, lbl in self.cmp_legend:
+            if 'vs_classic' in it.res:
+                sq.pack(side='left')
+                lbl.pack(side='left')
+            else:
+                sq.pack_forget()
+                lbl.pack_forget()
         lvl = it.res['motion_level']
         auto = ' (automatisch)' if self.s.motion_level < 0 else ''
         self.motion_hint.configure(text=f'aktivste {100 - lvl:.0f} % zählen als Action{auto}')
@@ -987,6 +1055,8 @@ class App:
                     self._run_analyze(job[1])
                 elif kind == 'export':
                     self._run_export(*job[1:])
+                elif kind == 'import':
+                    self._run_import(job[1])
             except Exception as e:  # never kill the worker
                 self.events.put(('error', job, str(e)))
 
@@ -1032,6 +1102,7 @@ class App:
                         full_length=full_length, duration=it.an['meta']['duration'],
                         deliver=render_kbps != 0, render_kbps=render_kbps, render_dir=out_dir or None)
                     loaded.append(tl)
+                    fs.save_export_record(it.path, res['segments'], full_length, target=f'DaVinci: {tl}')
                     self.events.put(('progress', k / len(items), prefix + f'In DaVinci geladen: {tl}'))
                     continue
                 if kind == 'mp4':
@@ -1040,6 +1111,8 @@ class App:
                 else:
                     path = fs.export_davinci(it.path, res['segments'], it.an['meta']['fps'], dest, kind,
                                              full_length=full_length, duration=it.an['meta']['duration'])
+                    # Reference for reading the edit back once the file is imported into Resolve
+                    fs.save_export_record(it.path, res['segments'], full_length, target=path)
             except fs.Cancelled:
                 self.events.put(('export_done', written, 'Export abgebrochen'))
                 return
@@ -1050,6 +1123,62 @@ class App:
             self.events.put(('export_done', written, msg))
             return
         self.events.put(('export_done', written, None))
+
+    def _run_import(self, it):
+        from davinci_timeline import read_timeline_cut  # Resolve API only when needed
+        project, timeline, spans, clips = read_timeline_cut(it.path, log=lambda m: self.events.put(('status', m)))
+        self.events.put(('import_done', it, project, timeline, spans, clips))
+
+    def start_import(self):
+        it = self.current
+        if it is None or it.an is None or self.busy_export:
+            return
+        self.busy_export = True
+        self._update_buttons()
+        self.jobs.put(('import', it))
+
+    def _apply_import(self, it, project, timeline, spans, clips):
+        """Turn the cut read back from DaVinci into corrections (and labels)."""
+        dur = it.an['meta']['duration']
+        final = [(max(0.0, a), min(dur, b)) for a, b in spans if min(dur, b) > max(0.0, a)]
+        rec = fs.load_export_record(it.path)
+        if rec is not None:
+            exported, ref = rec['segments'], f"dem Export vom {rec.get('time', '?')}"
+        else:
+            res = it.res or fs.decide(it.an, self.s, it.overrides)
+            exported, ref = res['segments'], 'dem aktuellen Vorschlag (kein Export gespeichert)'
+        changes = fs.edit_to_overrides(exported, final)
+        drops = [c for c in changes if c[2] == 'drop']
+        keeps = [c for c in changes if c[2] == 'keep']
+        kept = sum(b - a for a, b in final)
+        added = sum(b - a for a, b, _m in keeps)
+        # Every clip still in the timeline counts, orange ones too: a lot "added" usually means
+        # orange parts that were meant to go are still in there
+        warn = ''
+        if added > 120 and added > 0.5 * sum(b - a for a, b in exported):
+            warn = ('Achtung: auffällig viel dazugenommen. Liegen noch orange Clips in der Timeline, '
+                    'die eigentlich raus sollen? Dann „Abbrechen“, in DaVinci rausschneiden und nochmal.\n\n')
+        msg = (f'Timeline „{timeline}“ ({clips} Clips) gelesen.\n'
+               f'Im Schnitt: {fmt_time(kept)} (alles, was noch in der Timeline liegt). Gegenüber {ref}:\n'
+               f'  • {len(drops)} Stellen entfernt ({fmt_time(sum(b - a for a, b, _m in drops))})\n'
+               f'  • {len(keeps)} Stellen dazugenommen ({fmt_time(added)})\n\n'
+               + warn +
+               'Hast du das ganze Video in DaVinci durchgesehen?\n\n'
+               'Ja – alles in der Timeline gilt als gewollt, alles andere als ungewollt '
+               '(auch was du unverändert gelassen hast).\n'
+               'Nein – nur deine Änderungen werden übernommen.')
+        answer = messagebox.askyesnocancel(APP_NAME, msg)
+        if answer is None:
+            self.status_var.set('Übernehmen abgebrochen – nichts geändert.')
+            return
+        for a, b, mode in changes:
+            it.overrides = fs.set_override(it.overrides, a, b, mode)
+        fs.save_overrides(it.path, it.overrides)
+        fs.save_labels(it.path, final, reviewed=answer, source='davinci', note=f'{project} / {timeline}')
+        if it is self.current:
+            self._recompute()
+        self.status_var.set(f'Aus DaVinci übernommen: {len(drops)} entfernt, {len(keeps)} dazugenommen'
+                            + (' · Video als komplett geprüft gespeichert' if answer else ''))
 
     def _poll(self):
         try:
@@ -1092,6 +1221,10 @@ class App:
                     self.status_var.set(msg or (f'Exportiert: {written[-1]}' if len(written) == 1 else
                                                 f'{len(written)} Dateien exportiert' if written else 'Nichts exportiert'))
                     self._update_buttons()
+                elif kind == 'import_done':
+                    self.busy_export = False
+                    self._update_buttons()
+                    self._apply_import(*ev[1:])
                 elif kind == 'error':
                     self.busy_export = False
                     self.status_var.set('Fehler: ' + ev[2])
@@ -1165,6 +1298,7 @@ class App:
         any_ok = any(it.an is not None for it in self.items)
         running = self.busy_export or any(it.status.startswith('analysiert') for it in self.items)
         self.btn_export.state(['!disabled'] if cur_ok and not self.busy_export else ['disabled'])
+        self.btn_import.state(['!disabled'] if cur_ok and not self.busy_export else ['disabled'])
         self.btn_export_all.state(['!disabled'] if any_ok and not self.busy_export else ['disabled'])
         self.btn_cancel.state(['!disabled'] if running else ['disabled'])
         self.btn_open.state(['!disabled'] if self.last_export else ['disabled'])

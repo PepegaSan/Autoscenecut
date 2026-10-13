@@ -5,7 +5,8 @@ with kept parts coloured green and the rest orange (decide in DaVinci).
 
 Uses the open project (a new "Scenecut" project only if Resolve shows the Project Manager),
 reuses the clip if it is already in the media pool, and adds a new timeline next to the
-existing ones – nothing in the project is deleted or overwritten. Connection handling
+existing ones – nothing in the project is deleted or overwritten. read_timeline_cut reads the
+edited cut back (read only), so the edit in Resolve becomes corrections in Scenecut. Connection handling
 (launching Resolve, COM on worker threads, edition paths) comes from davinci_api.py.
 """
 import os
@@ -96,6 +97,104 @@ def color_parts(timeline, keep_flags):
                 item.SetClipColor(KEEP_COLOR if keep else DROP_COLOR)
             except Exception:
                 pass
+
+
+def _item_path(item):
+    try:
+        mpi = item.GetMediaPoolItem()
+        return _norm(mpi.GetClipProperty('File Path') or '') if mpi is not None else ''
+    except Exception:
+        return ''
+
+
+def _clip_frames(item):
+    try:
+        return int(item.GetMediaPoolItem().GetClipProperty('Frames') or 0)
+    except Exception:
+        return 0
+
+
+def _source_start(item):
+    """First source frame of a timeline item, relative to the clip start. GetSourceStartFrame
+    first; a value outside the clip (e.g. counted from a start timecode) falls back to
+    GetLeftOffset, the room to extend the clip to the left = the same frame."""
+    frames = _clip_frames(item)
+    for getter in ('GetSourceStartFrame', 'GetLeftOffset'):
+        try:
+            val = getattr(item, getter)()
+        except Exception:
+            continue
+        if val is None:
+            continue
+        val = int(round(float(val)))
+        if val >= 0 and (frames <= 0 or val < frames):
+            return val
+    raise ResolveError('DaVinci liefert für einen Clip keine brauchbare Quell-Position.')
+
+
+def _video_items(timeline, want):
+    for idx in range(1, int(timeline.GetTrackCount('video') or 0) + 1):
+        for item in timeline.GetItemListInTrack('video', idx) or []:
+            if _item_path(item) == want:
+                yield item
+
+
+def timeline_cut(timeline, video_path, fps):
+    """The final cut of one video in a timeline, as merged source spans in seconds: every clip of
+    this video on any video track that is still there and enabled, whatever its colour – what
+    you don't want, you cut out (also half of a split clip). Returns (spans, number of clips)."""
+    spans, found = [], 0
+    for item in _video_items(timeline, _norm(video_path)):
+        found += 1
+        try:
+            if item.GetClipEnabled() is False:
+                continue
+        except Exception:
+            pass
+        start = _source_start(item)
+        dur = int(round(float(item.GetDuration())))
+        spans.append((start / fps, (start + dur) / fps))
+    merged = []
+    for a, b in sorted(spans):
+        if merged and a <= merged[-1][1] + 1e-6:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return [(round(a, 3), round(b, 3)) for a, b in merged], found
+
+
+def find_timeline(project, video_path):
+    """The current timeline if it contains this video, otherwise the newest Scenecut timeline of
+    it (by name). None if there is none."""
+    want = _norm(video_path)
+    cur = project.GetCurrentTimeline()
+    if cur is not None and next(_video_items(cur, want), None) is not None:
+        return cur
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    found = None
+    for i in range(1, int(project.GetTimelineCount() or 0) + 1):
+        tl = project.GetTimelineByIndex(i)
+        if tl is not None and (tl.GetName() or '').startswith(f'{stem} – Scenecut') \
+                and next(_video_items(tl, want), None) is not None:
+            found = tl
+    return found
+
+
+def read_timeline_cut(video_path, log=print):
+    """Read the edited cut of this video back from the open Resolve project (read only, Resolve is
+    not started). Returns (project name, timeline name, spans in seconds, number of clips)."""
+    video_path = os.path.abspath(video_path)
+    fps = probe_source_fps(video_path)
+    with scripting_thread():
+        log('Verbinde mit DaVinci Resolve …')
+        _resolve, project, _pool, _root = connect_resolve(
+            status_callback=log, auto_launch=False, create_scratch_project_name=None)
+        timeline = find_timeline(project, video_path)
+        if timeline is None:
+            raise ResolveError(f'Im Projekt „{project.GetName()}“ gibt es keine Timeline mit diesem Video. '
+                               'Öffne die Scenecut-Timeline in DaVinci und versuch es nochmal.')
+        spans, found = timeline_cut(timeline, video_path, fps)
+        return project.GetName(), timeline.GetName(), spans, found
 
 
 def load_into_timeline(video_path, segments, log=print, timeline_name=None, full_length=False, duration=None,

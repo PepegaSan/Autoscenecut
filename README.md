@@ -34,6 +34,10 @@ Manual alternative: `pip install -r requirements.txt`, then `python scenecut_app
    Click to play from there (ffplay, optionally muted).
 4. **Fix outliers yourself**: drag over a range or right-click a stretch → *always keep* /
    *always cut*. These corrections win over all sliders and are saved per video.
+   *Schnitt aus DaVinci übernehmen* does the same from your edit in Resolve: it reads the
+   video's timeline back (read only) and turns what you deleted, trimmed or brought back into
+   corrections. Every clip still in the timeline counts as kept, whatever its colour (also
+   one half of a split clip); what you cut out or disable counts as removed.
 5. **Export**
    - *Direkt in DaVinci laden*: new timeline in the open Resolve project (Resolve is started if
      needed; existing timelines are never touched)
@@ -51,9 +55,33 @@ Settings are remembered in `scenecut_settings.json` next to the app.
   less than motion in the picture. Cuts are isolated difference spikes.
 - **Sound**: the whole track through YAMNet (`yamnet.onnx`) – speech, vocal sounds, music,
   silence per 0.48 s.
-- **Decision**: motion threshold as a percentile of the video itself (automatic split by
-  default), hysteresis, gap closing, minimum length, edges snapped to cuts, then the manual
-  corrections on top.
+- **Decision** (*Entscheidung*):
+  - *klassisch*: motion threshold as a percentile of the video itself (automatic split by
+    default) OR vocal sounds keep a frame, every dialog hit cuts it out.
+  - *kombiniert*: one score per frame – motion, vocal sounds and loudness (rank within the
+    video) count for it, ongoing dialog (share of a 4 s window, only where speech beats vocal
+    sounds) and music against it; *Strenge* sets the bar. Quiet motion drops out, a single
+    "speech" hit in the middle of action no longer cuts a hole. In the timeline a yellow bar
+    marks what is new against *klassisch*, a grey one what goes.
+  - *Action-Blöcke*: decides whole stretches instead of single seconds, so calm moments in the
+    middle of the action stay in. Evidence averaged over 30 s (vocal sounds count most, then
+    motion and loudness, dialog against it); every switch between in and out costs
+    *Blockgröße* seconds of clear evidence (two-state Viterbi). The weights come from the first
+    fully reviewed video and are provisional (`BLOCK_W` in `fast_scan.py`).
+  - Then hysteresis, gap closing, minimum length, edges snapped to cuts, and the manual
+    corrections on top.
+
+## Measuring and learning
+
+Every correction is a label. `python evaluate.py` decides all cached videos with corrections
+again without them and shows how much of what you wanted stays and how much of what you
+removed goes – for all three decision modes (`--sweep`: several strictness levels).
+A DaVinci read-back where you confirm that you went through the whole video counts fully:
+everything in the timeline as wanted, everything else as not.
+
+The analysis also stores YAMNet's 1024-value sound fingerprint per 0.96 s
+(`*.embed.npz` in the cache) – the raw material for a classifier trained on your own labels
+once enough videos are corrected.
 
 ## Command line
 
@@ -70,6 +98,7 @@ python fast_scan.py VIDEO [--motion-level 60] [--speech remove|ignore|keep] [--e
 | `davinci_timeline.py` | loads segments into a Resolve timeline |
 | `davinci_api.py` | Resolve connection (vendored from the Hail Mary project) |
 | `timeline_export.py` | FCP7 XML and CMX EDL files |
+| `evaluate.py` | measures the decision against your corrections |
 | `yamnet.onnx`, `yamnet_class_map.csv` | sound classification model |
 
 ## Tests

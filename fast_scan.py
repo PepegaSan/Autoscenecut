@@ -178,13 +178,32 @@ def load_yamnet():
     return _YAMNET
 
 
-def extract_audio_features(video, cancel=None):
-    """Per YAMNet frame (0.48 s): group scores 0..1 and loudness (dBFS). None without sound/model."""
+EMBED_POOL = 2  # YAMNet frames per stored embedding (0.96 s)
+EMBED_SCALE = 32.0  # embedding values (ReLU, 0..~8) stored as uint8 * 1/32
+
+
+def _pool_embeddings(emb):
+    """(n, 1024) float → (ceil(n / EMBED_POOL), 1024) uint8, mean over EMBED_POOL frames."""
+    n = len(emb)
+    pad = -n % EMBED_POOL
+    if pad:
+        emb = np.concatenate([emb, emb[-1:].repeat(pad, axis=0)])
+    pooled = emb.reshape(-1, EMBED_POOL, emb.shape[1]).mean(axis=1)
+    return np.clip(np.round(pooled * EMBED_SCALE), 0, 255).astype(np.uint8)
+
+
+def extract_audio_features(video, cancel=None, embeddings=False):
+    """Per YAMNet frame (0.48 s): group scores 0..1 and loudness (dBFS). None without sound/model.
+
+    embeddings=True adds 'emb' (YAMNet's 1024-value sound fingerprint per 0.96 s, uint8, see
+    EMBED_SCALE) and 'emb_t' (centre times) – raw material for a classifier trained on own labels.
+    """
     ym = load_yamnet()
     if ym is None:
         return None
     sess, groups = ym
     inp = sess.get_inputs()[0].name
+    emb_parts = []
     cmd = ['ffmpeg', '-v', 'error', '-nostdin', '-i', video, '-vn', '-sn', '-dn',
            '-ac', '1', '-ar', str(AUDIO_SR), '-f', 'f32le', '-']
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -215,7 +234,10 @@ def extract_audio_features(video, cancel=None):
             x = w[:(n - 1) * YAMNET_HOP + YAMNET_WINDOW]
             x = np.pad(x, (0, (n - 1) * YAMNET_HOP + YAMNET_WINDOW - len(x)))
             carry = w[n * YAMNET_HOP:]
-            scores = np.asarray(sess.run(None, {inp: x})[0])[:n]
+            outs = sess.run(None, {inp: x})
+            scores = np.asarray(outs[0])[:n]
+            if embeddings:
+                emb_parts.append(np.asarray(outs[1], np.float32)[:n])
             for g, idx in groups.items():
                 out[g].append(scores[:, idx].max(axis=1) if idx else np.zeros(len(scores)))
             frames = np.lib.stride_tricks.sliding_window_view(x, YAMNET_WINDOW)[::YAMNET_HOP][:n]
@@ -231,6 +253,10 @@ def extract_audio_features(video, cancel=None):
     res = {g: np.concatenate(v).astype(np.float32) for g, v in out.items()}
     res['loud'] = np.asarray(loud, np.float32)
     res['t'] = (np.arange(len(loud)) * YAMNET_HOP + YAMNET_WINDOW / 2) / AUDIO_SR
+    if embeddings:
+        res['emb'] = _pool_embeddings(np.concatenate(emb_parts))
+        res['emb_t'] = ((np.arange(len(res['emb'])) * EMBED_POOL + (EMBED_POOL - 1) / 2) * YAMNET_HOP
+                        + YAMNET_WINDOW / 2).astype(np.float32) / AUDIO_SR
     return res
 
 
@@ -248,9 +274,46 @@ def _cache_path(video, cache_dir):
     return os.path.join(cache_dir, f'{base}.{tag}.features.npz')
 
 
+def _side_path(video, kind, cache_dir=None):
+    """Per-video file next to the analysis cache: <name>.<tag>.<kind>"""
+    return _cache_path(os.path.abspath(video), cache_dir or default_cache_dir()).replace(
+        '.features.npz', '.' + kind)
+
+
 def _stamp(video):
     st = os.stat(video)
     return np.asarray([st.st_size, st.st_mtime, FEATURES_VERSION, SAMPLE_FPS], np.float64)
+
+
+def _save_embeddings(video, a, cache_dir=None):
+    path = _side_path(video, 'embed.npz', cache_dir)
+    try:
+        np.savez_compressed(path, stamp=_stamp(video), emb=a['emb'], emb_t=a['emb_t'],
+                            scale=np.float32(EMBED_SCALE))
+    except OSError as e:
+        print(f'Embeddings not written: {e}', flush=True)
+
+
+def load_embeddings(video, cache_dir=None, compute_missing=False, cancel=None):
+    """(emb float32 (n, 1024), centre times in s) or None. compute_missing runs a sound-only
+    pass for videos analyzed before embeddings were stored."""
+    video = os.path.abspath(video)
+    path = _side_path(video, 'embed.npz', cache_dir)
+    if os.path.isfile(path):
+        try:
+            z = np.load(path)
+            if np.array_equal(z['stamp'], _stamp(video)):
+                return z['emb'].astype(np.float32) / float(z['scale']), z['emb_t']
+        except Exception:
+            pass
+    if not compute_missing:
+        return None
+    a = extract_audio_features(video, cancel, embeddings=True)
+    if a is None:
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _save_embeddings(video, a, cache_dir)
+    return a['emb'].astype(np.float32) / EMBED_SCALE, a['emb_t']
 
 
 def analyze(video, cache_dir=None, use_cache=True, progress=None, cancel=None):
@@ -280,7 +343,7 @@ def analyze(video, cache_dir=None, use_cache=True, progress=None, cancel=None):
 
     def run_audio():
         try:
-            audio['res'] = extract_audio_features(video, cancel)
+            audio['res'] = extract_audio_features(video, cancel, embeddings=True)
         except Exception as e:  # sound is optional, the picture is not
             audio_err.append(e)
 
@@ -311,6 +374,8 @@ def analyze(video, cache_dir=None, use_cache=True, progress=None, cancel=None):
         os.makedirs(cache_dir, exist_ok=True)
         np.savez_compressed(cache, stamp=stamp, meta=json.dumps(an['meta']),
                             **{k: an[k] for k in VIDEO_KEYS + AUDIO_KEYS})
+        if a is not None and 'emb' in a:
+            _save_embeddings(video, a, cache_dir)
     except OSError as e:
         print(f'Cache not written: {e}', flush=True)
     if progress:
@@ -335,6 +400,9 @@ class Settings:
     min_len_s: float = 4.0
     pad_s: float = 0.0
     snap_s: float = 1.5
+    decision: str = 'classic'  # classic: motion OR vocal, dialog cuts out | score: weighted sum | blocks
+    strictness: float = 50.0  # score / blocks: 0 = keep almost everything with some evidence, 100 = only the clearest
+    block_s: float = 30.0  # blocks: what one switch between in and out costs, in seconds of clear evidence
 
     @classmethod
     def from_dict(cls, d):
@@ -493,9 +561,87 @@ def apply_overrides(segs, overrides, duration):
     return [(round(a, 2), round(b, 2)) for a, b in segs if b - a >= 0.1]
 
 
+def set_override(overrides, a, b, mode):
+    """New correction list: mode 'keep' / 'drop' adds [a, b) (older ones give way there),
+    None only removes corrections inside [a, b)."""
+    out = []
+    for o_a, o_b, o_m in overrides:
+        if o_b <= a or o_a >= b:
+            out.append((o_a, o_b, o_m))
+            continue
+        if o_a < a:
+            out.append((o_a, a, o_m))
+        if o_b > b:
+            out.append((b, o_b, o_m))
+    if mode is not None:
+        out.append((round(a, 2), round(b, 2), mode))
+    return out
+
+
+def spans_minus(segs, others, min_len=0.0):
+    """Parts of segs not covered by others, pieces shorter than min_len dropped."""
+    out = sorted(segs)
+    for a, b in others:
+        out = cut_span(out, a, b)
+    return [(a, b) for a, b in out if b - a >= min_len]
+
+
+def edit_to_overrides(exported, final, min_len=0.3):
+    """Corrections that turn the exported keep-segments into the final cut: what was removed
+    becomes 'drop', what was added 'keep'. Differences below min_len are frame rounding."""
+    drops = [(a, b, 'drop') for a, b in spans_minus(exported, final, min_len)]
+    keeps = [(a, b, 'keep') for a, b in spans_minus(final, exported, min_len)]
+    return sorted(drops + keeps)
+
+
 def _overrides_path(video, cache_dir=None):
-    return _cache_path(os.path.abspath(video), cache_dir or default_cache_dir()).replace(
-        '.features.npz', '.overrides.json')
+    return _side_path(video, 'overrides.json', cache_dir)
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=1)
+
+
+def save_export_record(video, segments, full_length, target='', cache_dir=None):
+    """What went out to a timeline (DaVinci, XML, EDL) – the reference for reading the edit back."""
+    _write_json(_side_path(video, 'export.json', cache_dir), {
+        'segments': [[round(a, 3), round(b, 3)] for a, b in segments], 'full_length': bool(full_length),
+        'target': target, 'time': time.strftime('%Y-%m-%d %H:%M:%S')})
+
+
+def load_export_record(video, cache_dir=None):
+    d = _read_json(_side_path(video, 'export.json', cache_dir))
+    if not isinstance(d, dict):
+        return None
+    d['segments'] = [(float(a), float(b)) for a, b in d.get('segments', [])]
+    return d
+
+
+def save_labels(video, final, reviewed, source, note='', cache_dir=None):
+    """Ground truth for evaluation / training. reviewed=True: the whole video was looked at, so
+    everything inside final is wanted and everything outside is not. reviewed=False: only the
+    corrections (overrides) count."""
+    _write_json(_side_path(video, 'labels.json', cache_dir), {
+        'final': [[round(a, 3), round(b, 3)] for a, b in final], 'reviewed': bool(reviewed),
+        'source': source, 'note': note, 'time': time.strftime('%Y-%m-%d %H:%M:%S')})
+
+
+def load_labels(video, cache_dir=None):
+    d = _read_json(_side_path(video, 'labels.json', cache_dir))
+    if not isinstance(d, dict):
+        return None
+    d['final'] = [(float(a), float(b)) for a, b in d.get('final', [])]
+    return d
 
 
 def load_overrides(video, cache_dir=None):
@@ -517,6 +663,125 @@ def save_overrides(video, overrides, cache_dir=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump([[round(a, 2), round(b, 2), m] for a, b, m in overrides], f)
+
+
+# Score mode: every signal adds or subtracts evidence instead of switching on its own
+# (ratios from a logistic fit on the first corrected videos: dialog weighs about twice as much
+# as motion, vocal sounds about as much, loudness little)
+SCORE_W = {'motion': 1.0, 'vocal': 1.0, 'loud': 0.3, 'dialog': 2.0, 'dialog_keep': 0.8, 'music': 1.0}
+MOTION_SCALE = 0.35  # log motion distance to the threshold that counts as clearly above / below (±35 %)
+SUSTAIN_S = 4.0  # dialog and music count by their share of this window, not by single 0.48 s hits
+SCORE_RANGE = 1.5  # display: score -1.5..1.5 → 0..100
+SCORE_BAND = 0.1
+
+
+def _ramp(x, lo, hi):
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def score_parts(an, s, logm, thr, still, win):
+    """Evidence per frame, each roughly -1..1 (or 0..1), before weighting.
+
+    motion: log motion relative to the threshold, still pictures -1
+    vocal: 0..1, about 0.6 at vocal_level
+    loud: loudness rank within this video, -1 (quietest) .. 1 (loudest) – motion without sound
+          is usually walking around, setting up, b-roll
+    dialog: share of the SUSTAIN_S window with speech above speech_level that is also stronger
+            than the vocal sounds (YAMNet calls a lot of vocal sounds 'speech') – a single hit
+            costs little, ongoing talk a lot
+    music: music share of the window, 0 below 25 %, 1 above 75 % (intros, credits)
+    """
+    n = len(logm)
+    sus = max(1, int(SUSTAIN_S * SAMPLE_FPS))
+    m = np.tanh((logm - thr) / MOTION_SCALE)
+    m[still] = -1.0
+    parts = {'motion': m}
+    if not an['meta'].get('has_audio'):
+        return parts
+    vocal = rolling_mean(an['vocal'], win) * 100.0
+    parts['vocal'] = 1.0 - np.exp(-vocal / max(s.vocal_level, 1.0))
+    loud = rolling_mean(an['loud'], max(win, int(3 * SAMPLE_FPS)))
+    srt = np.sort(loud)
+    # Mean rank for equal values (digital silence is one value everywhere)
+    rank = (np.searchsorted(srt, loud, 'left') + np.searchsorted(srt, loud, 'right') - 1) / 2.0
+    parts['loud'] = rank / max(n - 1, 1) * 2.0 - 1.0
+    sp = an['speech'] * 100.0
+    dialog_hit = (sp > s.speech_level) & (an['speech'] > an['vocal'])
+    parts['dialog'] = rolling_mean(dialog_hit.astype(np.float64), sus)
+    parts['music'] = _ramp(rolling_mean((an['music'] * 100.0 > s.music_level).astype(np.float64), sus), 0.25, 0.75)
+    return parts
+
+
+def combine_score(parts, s):
+    w = SCORE_W
+    score = np.zeros(len(parts['motion']))
+    if s.motion_keep:
+        score += w['motion'] * parts['motion']
+    if 'vocal' not in parts:
+        return score
+    if s.vocal_keep:
+        score += w['vocal'] * parts['vocal']
+    score += w['loud'] * parts['loud']
+    if s.speech_mode == 'remove':
+        score -= w['dialog'] * parts['dialog']
+    elif s.speech_mode == 'keep':
+        score += w['dialog_keep'] * parts['dialog']
+    score += (w['music'] if s.music_keep else -w['music']) * parts['music']
+    return score
+
+
+def score_threshold(strictness):
+    return (min(max(float(strictness), 0.0), 100.0) - 50.0) / 50.0 * 0.8
+
+
+# Blocks mode: whole action stretches instead of second-by-second decisions. Weights are a
+# logistic fit on the first fully reviewed video (30 s averages): vocal sounds carry most,
+# motion and loudness a little, dialog a little against it. Music never occurred there – its
+# weight is a guess. To be refitted once more videos are reviewed (evaluate.py).
+BLOCK_W = {'motion': 0.8, 'vocal': 9.8, 'loud': 0.45, 'dialog': -0.3, 'dialog_keep': 0.3, 'music': 1.0,
+           'bias': -2.1}
+BLOCK_SMOOTH_S = 30.0
+BLOCK_RANGE = 4.0  # display: logit -4..4 → 0..100
+
+
+def block_evidence(parts, s):
+    """Log-odds per frame that this belongs to a wanted block (before the strictness offset)."""
+    w = BLOCK_W
+    if 'vocal' not in parts:  # no sound: motion alone, centred on the motion threshold
+        return parts['motion'] * (1.0 if s.motion_keep else 0.0)
+    ev = np.full(len(parts['motion']), w['bias'])
+    if s.motion_keep:
+        ev += w['motion'] * parts['motion']
+    if s.vocal_keep:
+        ev += w['vocal'] * parts['vocal']
+    ev += w['loud'] * parts['loud']
+    if s.speech_mode == 'remove':
+        ev += w['dialog'] * parts['dialog']
+    elif s.speech_mode == 'keep':
+        ev += w['dialog_keep'] * parts['dialog']
+    ev += (w['music'] if s.music_keep else -w['music']) * parts['music']
+    return ev
+
+
+def block_path(gain, cost):
+    """Best in/out labelling of a per-second gain curve when 'in' earns gain[i], 'out' earns 0
+    and every switch costs `cost` (two-state Viterbi). Returns a bool array."""
+    n = len(gain)
+    if n == 0:
+        return np.zeros(0, bool)
+    back = np.zeros((n, 2), bool)  # True = came from the other state
+    v_out, v_in = 0.0, float(gain[0]) - cost  # the video starts 'out': a block at the start pays its switch too
+    for i in range(1, n):
+        o_sw, i_sw = v_in - cost > v_out, v_out - cost > v_in
+        back[i] = (o_sw, i_sw)
+        v_out, v_in = (v_in - cost if o_sw else v_out), (v_out - cost if i_sw else v_in) + float(gain[i])
+    path = np.zeros(n, bool)
+    st = v_in > v_out
+    for i in range(n - 1, -1, -1):
+        path[i] = st
+        if i and back[i, int(st)]:
+            st = not st
+    return path
 
 
 def decide(an, s, overrides=None):
@@ -554,18 +819,41 @@ def decide(an, s, overrides=None):
         'speech': hysteresis(curves['speech'], s.speech_level),
         'music': hysteresis(curves['music'], s.music_level),
     }
-    keep = np.zeros(n, bool)
-    if s.motion_keep:
-        keep |= masks['motion']
-    if s.vocal_keep:
-        keep |= masks['vocal']
-    if s.music_keep:
-        keep |= masks['music']
-    if s.speech_mode == 'keep':
-        keep |= masks['speech']
-    keep = fill_gaps(keep, int(s.merge_gap_s * SAMPLE_FPS))
-    if s.speech_mode == 'remove':
-        keep &= ~masks['speech']
+    score_line = None
+    if s.decision == 'score':
+        parts = score_parts(an, s, logm, thr, still, win)
+        score = rolling_mean(combine_score(parts, s), win)
+        sthr = score_threshold(s.strictness)
+        curves['score'] = np.clip((score + SCORE_RANGE) / (2 * SCORE_RANGE) * 100.0, 0, 100)
+        score_line = float(np.clip((sthr + SCORE_RANGE) / (2 * SCORE_RANGE) * 100.0, 0, 100))
+        if 'dialog' in parts:
+            masks['speech'] = parts['dialog'] > 0.5  # what the score treats as dialog
+        keep = fill_gaps(hysteresis(score, sthr, band=SCORE_BAND), int(s.merge_gap_s * SAMPLE_FPS))
+    elif s.decision == 'blocks':
+        parts = score_parts(an, s, logm, thr, still, win)
+        ev = rolling_mean(block_evidence(parts, s), int(BLOCK_SMOOTH_S * SAMPLE_FPS))
+        offset = score_threshold(s.strictness) / 0.8 * 1.5  # strictness 0..100 → -1.5..1.5
+        fps = int(SAMPLE_FPS)
+        sec = -(-n // fps)
+        per_sec = np.pad(ev, (0, sec * fps - n), mode='edge').reshape(sec, fps).mean(axis=1)
+        keep = np.repeat(block_path(per_sec - offset, max(float(s.block_s), 0.0)), fps)[:n]
+        curves['score'] = np.clip((ev + BLOCK_RANGE) / (2 * BLOCK_RANGE) * 100.0, 0, 100)
+        score_line = float(np.clip((offset + BLOCK_RANGE) / (2 * BLOCK_RANGE) * 100.0, 0, 100))
+        if 'dialog' in parts:
+            masks['speech'] = parts['dialog'] > 0.5
+    else:
+        keep = np.zeros(n, bool)
+        if s.motion_keep:
+            keep |= masks['motion']
+        if s.vocal_keep:
+            keep |= masks['vocal']
+        if s.music_keep:
+            keep |= masks['music']
+        if s.speech_mode == 'keep':
+            keep |= masks['speech']
+        keep = fill_gaps(keep, int(s.merge_gap_s * SAMPLE_FPS))
+        if s.speech_mode == 'remove':
+            keep &= ~masks['speech']
 
     snap_d = int(s.snap_s * SAMPLE_FPS)
     segs = []
@@ -587,6 +875,7 @@ def decide(an, s, overrides=None):
         'segments': segs, 'curves': curves, 'masks': masks, 'keep': keep, 'cuts': cuts,
         'auto_motion_level': auto_level, 'motion_level': level, 'overrides': list(overrides or []),
         'motion_line': float(np.clip((thr - lo_v) * scale, 0, 100)),  # threshold on the display scale
+        'score_line': score_line,  # score mode: threshold on the 0..100 score curve
         'stats': {'kept_sec': kept, 'duration': duration, 'share': kept / max(duration, 1e-6),
                   'segments': len(segs), 'cuts': int(len(cuts))},
     }
@@ -695,6 +984,8 @@ def main():
                     help='motion percentile 0..100 to count as action (default: automatic)')
     ap.add_argument('--no-vocal', action='store_true')
     ap.add_argument('--speech', choices=('ignore', 'keep', 'remove'), default='remove')
+    ap.add_argument('--decision', choices=('classic', 'score', 'blocks'), default='classic')
+    ap.add_argument('--strictness', type=float, default=50.0, help='score mode: 0..100')
     ap.add_argument('--export', default='', help='comma list of xml, edl, mp4')
     args = ap.parse_args()
 
@@ -703,7 +994,8 @@ def main():
     t0 = time.time()
     an = analyze(video, use_cache=not args.no_cache,
                  progress=lambda p, _t: print(f'PROGRESS:{int(p * 100)}', flush=True))
-    s = Settings(motion_level=args.motion_level, vocal_keep=not args.no_vocal, speech_mode=args.speech)
+    s = Settings(motion_level=args.motion_level, vocal_keep=not args.no_vocal, speech_mode=args.speech,
+                 decision=args.decision, strictness=args.strictness)
     res = decide(an, s)
     st = res['stats']
     print(f"Analysis {an['meta']['analysis_sec']} s (this run {time.time() - t0:.1f} s) | sound: "

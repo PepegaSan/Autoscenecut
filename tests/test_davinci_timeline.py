@@ -261,6 +261,96 @@ def test_deliver_setup(tmp_path: Path):
     assert project.render_calls == [], 'deliver=False must leave the Deliver page alone'
 
 
+class EditedItem:
+    """Timeline item as the user left it in Resolve."""
+    def __init__(self, clip, src_start, frames, color='', enabled=True, start_getter=True):
+        self.clip, self.src_start, self.frames = clip, src_start, frames
+        self.color, self.enabled = color, enabled
+        if not start_getter:  # older Resolve: only GetLeftOffset
+            self.GetSourceStartFrame = None
+
+    def GetMediaPoolItem(self):
+        return self.clip
+
+    def GetSourceStartFrame(self):
+        return self.src_start
+
+    def GetLeftOffset(self):
+        return self.src_start
+
+    def GetDuration(self):
+        return self.frames
+
+    def GetClipColor(self):
+        return self.color
+
+    def GetClipEnabled(self):
+        return self.enabled
+
+
+class EditedTimeline(FakeTimeline):
+    def __init__(self, name, tracks):
+        super().__init__(name, {})
+        self.tracks = tracks
+
+    def GetTrackCount(self, kind):
+        return len(self.tracks) if kind == 'video' else 0
+
+    def GetItemListInTrack(self, kind, index):
+        return self.tracks[index - 1] if kind == 'video' else []
+
+
+def test_read_back(tmp_path: Path):
+    vid = _video(tmp_path)
+    mine = FakeClip(str(vid).replace('\\', '/'), frames=3000)
+    other = FakeClip('E:/other.mp4', frames=3000)
+    # 25 fps. Full-length timeline after editing: green 0–4 s, green 4–8 s deleted, orange
+    # 8–10 s split and only its first half kept, green 10–12 s disabled, then 12–16 s split into
+    # two touching clips; on track 2 another video and 20–21 s of this one. Colour doesn't count.
+    track1 = [EditedItem(mine, 0, 100, 'Green'), EditedItem(mine, 200, 25, 'Orange'),
+              EditedItem(mine, 250, 50, 'Green', enabled=False),
+              EditedItem(mine, 300, 50), EditedItem(mine, 350, 50, start_getter=False)]
+    track2 = [EditedItem(other, 0, 500), EditedItem(mine, 500, 25)]
+    tl = EditedTimeline('My Clip – Scenecut (ganzes Video)', [track1, track2])
+    spans, found = dt.timeline_cut(tl, str(vid), 25.0)
+    assert spans == [(0.0, 4.0), (8.0, 9.0), (12.0, 16.0), (20.0, 21.0)], spans
+    assert found == 6, found
+
+    # A start counted from a timecode (outside the clip) falls back to GetLeftOffset
+    odd = EditedItem(mine, 40, 25)
+    odd.GetSourceStartFrame = lambda: 86400 * 25
+    assert dt.timeline_cut(EditedTimeline('x', [[odd]]), str(vid), 25.0)[0] == [(1.6, 2.6)]
+
+    # Which timeline: the open one if it has the video, otherwise the newest Scenecut one
+    project = FakeProject('Edit', timelines=[EditedTimeline('Rough cut', [[EditedItem(other, 0, 10)]]),
+                                             EditedTimeline('My Clip – Scenecut', [[EditedItem(mine, 0, 10)]]),
+                                             tl])
+    project.GetCurrentTimeline = lambda: project.timelines[0]
+    assert dt.find_timeline(project, str(vid)) is tl
+    project.GetCurrentTimeline = lambda: project.timelines[1]
+    assert dt.find_timeline(project, str(vid)) is project.timelines[1]
+
+    # Through read_timeline_cut: read only, Resolve must not be started for it
+    calls = []
+    _patch(project, FakeResolve(), fps=25.0)
+
+    def connect(**kw):
+        calls.append(kw)
+        return FakeResolve(), project, project.pool, project.pool.root
+    dt.connect_resolve = connect
+    proj, name, spans, n = dt.read_timeline_cut(str(vid), log=lambda m: None)
+    assert (proj, name, spans, n) == ('Edit', 'My Clip – Scenecut', [(0.0, 0.4)], 1), (proj, name, spans, n)
+    assert calls[0]['auto_launch'] is False and calls[0]['create_scratch_project_name'] is None, calls
+    project.GetCurrentTimeline = lambda: None
+    project.timelines = project.timelines[:1]
+    try:
+        dt.read_timeline_cut(str(vid), log=lambda m: None)
+    except dt.ResolveError:
+        pass
+    else:
+        raise AssertionError('no timeline with the video must raise')
+
+
 def test_no_segments(tmp_path: Path):
     try:
         dt.load_into_timeline(str(_video(tmp_path)), [])
@@ -272,7 +362,7 @@ def test_no_segments(tmp_path: Path):
 def main() -> int:
     import shutil
     tests = [test_empty_project, test_existing_project_reuses_clip_and_keeps_timelines, test_full_length,
-             test_deliver_setup, test_no_segments]
+             test_deliver_setup, test_read_back, test_no_segments]
     work = _ROOT / 'output' / '_davinci_timeline_test'
     failed = 0
     for fn in tests:

@@ -25,7 +25,7 @@ def _overlap(segs, a, b):
     return sum(max(0.0, min(e, b) - max(s, a)) for s, e in segs)
 
 
-def _fake_analysis(seconds, motion_fn, vocal_fn=None, speech_fn=None, cuts_at=()):
+def _fake_analysis(seconds, motion_fn, vocal_fn=None, speech_fn=None, cuts_at=(), loud_fn=None):
     """Analysis dict like fs.analyze() returns, from per-second functions."""
     n = int(seconds * FPS)
     t = np.arange(n) / FPS
@@ -40,7 +40,7 @@ def _fake_analysis(seconds, motion_fn, vocal_fn=None, speech_fn=None, cuts_at=()
         'vocal': np.array([vocal_fn(x) if vocal_fn else 0.0 for x in t], np.float32),
         'speech': np.array([speech_fn(x) if speech_fn else 0.0 for x in t], np.float32),
         'music': np.zeros(n, np.float32), 'silence': np.zeros(n, np.float32),
-        'loud': np.full(n, -40.0, np.float32),
+        'loud': np.array([loud_fn(x) if loud_fn else -40.0 for x in t], np.float32),
         'meta': {'duration': seconds, 'fps': 25.0, 'has_audio': True},
     }
     return an
@@ -126,6 +126,101 @@ def test_decide_motion_vocal_speech():
     assert segs == [], segs
 
 
+def test_score_mode():
+    # Busy 50–150 s (loud), busy but quiet 200–260 s, a 1 s speech blip inside the action at
+    # 100 s, real dialog with motion 300–360 s (speech 70 % of the time)
+    def motion(x):
+        return 0.05 if 50 <= x < 150 or 200 <= x < 260 or 300 <= x < 360 else 0.01
+
+    def speech(x):
+        return 0.9 if 100 <= x < 101 or (300 <= x < 360 and x % 10 < 7) else 0.0
+    an = _fake_analysis(400, motion_fn=motion, speech_fn=speech,
+                        vocal_fn=lambda x: 0.6 if 50 <= x < 150 else 0.0,
+                        loud_fn=lambda x: -45.0 if 200 <= x < 260 else -20.0)
+    base = dict(motion_level=-1, speech_level=40, min_len_s=4, merge_gap_s=2)
+    classic = fs.decide(an, fs.Settings(**base))['segments']
+    assert _overlap(classic, 99, 102) < 2.5, f'classic: the blip cuts a hole into the action: {classic}'
+    res = fs.decide(an, fs.Settings(**base, decision='score', strictness=50))
+    segs = res['segments']
+    assert _overlap(segs, 55, 145) > 85, f'score: blip must not cut the action: {segs}'
+    assert _overlap(segs, 305, 355) < 5, f'score: ongoing dialog goes: {segs}'
+    assert _overlap(segs, 0, 45) == 0, segs
+    assert 'score' in res['curves'] and 0 <= res['score_line'] <= 100
+    # strictness: quiet motion goes before loud motion with voice
+    strict = fs.decide(an, fs.Settings(**base, decision='score', strictness=100))['segments']
+    assert _overlap(strict, 205, 255) < _overlap(segs, 205, 255), (strict, segs)
+    assert _overlap(strict, 55, 145) > 85, strict
+    # classic stays exactly as before
+    assert fs.decide(an, fs.Settings(**base, decision='classic'))['segments'] == classic
+    assert fs.decide(an, fs.Settings(**base))['score_line'] is None
+
+
+def test_block_path():
+    gain = np.r_[np.full(10, -1.0), np.full(30, 1.0), np.full(5, -1.0), np.full(30, 1.0), np.full(10, -1.0)]
+    # a short dip inside a long block costs less than two switches
+    assert fs.mask_to_runs(fs.block_path(gain, 10.0)) == [(10, 75)]
+    # cheap switching follows the gain exactly
+    assert fs.mask_to_runs(fs.block_path(gain, 0.5)) == [(10, 40), (45, 75)]
+    # too expensive for any block that does not pay for its two switches
+    assert not fs.block_path(np.r_[np.full(10, -1.0), np.full(5, 1.0), np.full(10, -1.0)], 3.0).any()
+
+
+def test_blocks_mode():
+    # Action 60–300 s with vocal sounds, a calm 40 s stretch inside (150–190: little motion, no
+    # voice, people re-positioning); dialog with motion 400–500 s; quiet nothing elsewhere
+    def motion(x):
+        return 0.05 if (60 <= x < 150 or 190 <= x < 300 or 400 <= x < 500) else 0.01
+
+    def vocal(x):
+        return 0.5 if (60 <= x < 150 or 190 <= x < 300) else 0.0
+
+    def speech(x):
+        return 0.8 if 400 <= x < 500 else 0.0
+    an = _fake_analysis(600, motion_fn=motion, vocal_fn=vocal, speech_fn=speech,
+                        loud_fn=lambda x: -20.0 if 60 <= x < 500 else -40.0)
+    s = fs.Settings(motion_level=-1, speech_level=40, decision='blocks', strictness=50, block_s=60)
+    res = fs.decide(an, s)
+    segs = res['segments']
+    assert len(segs) == 1 and _overlap(segs, 70, 290) > 215, f'one block, calm stretch inside: {segs}'
+    assert _overlap(segs, 410, 490) == 0 and _overlap(segs, 0, 40) == 0, segs
+    assert 0 <= res['score_line'] <= 100 and 'score' in res['curves']
+    # small blocks: the calm stretch goes
+    small = fs.decide(an, fs.Settings(**{**s.to_dict(), 'block_s': 2}))['segments']
+    assert _overlap(small, 165, 175) == 0 and _overlap(small, 70, 140) > 60, small
+
+
+def test_override_helpers():
+    ov = fs.set_override([(10.0, 20.0, 'drop')], 15.0, 30.0, 'keep')
+    assert ov == [(10.0, 15.0, 'drop'), (15.0, 30.0, 'keep')], ov
+    assert fs.set_override(ov, 0.0, 100.0, None) == []
+    assert fs.spans_minus([(0.0, 10.0), (20.0, 30.0)], [(5.0, 25.0)]) == [(0.0, 5.0), (25.0, 30.0)]
+    # exported 10–20 and 40–50; in the edit 10–20 got trimmed to 12–20 (+ 1 frame rounding at
+    # the end), 40–50 deleted, 60–65 added
+    out = fs.edit_to_overrides([(10.0, 20.0), (40.0, 50.0)], [(12.0, 20.04), (60.0, 65.0)])
+    assert out == [(10.0, 12.0, 'drop'), (40.0, 50.0, 'drop'), (60.0, 65.0, 'keep')], out
+
+
+def test_labels_and_export_record(tmp_path: Path):
+    vid = Path(tmp_path) / 'v.mp4'
+    vid.write_bytes(b'x')
+    c = str(tmp_path)
+    assert fs.load_labels(str(vid), c) is None and fs.load_export_record(str(vid), c) is None
+    fs.save_export_record(str(vid), [(1.0, 2.5)], True, 'DaVinci: tl', cache_dir=c)
+    rec = fs.load_export_record(str(vid), c)
+    assert rec['segments'] == [(1.0, 2.5)] and rec['full_length'] is True, rec
+    fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=True, source='davinci', cache_dir=c)
+    lab = fs.load_labels(str(vid), c)
+    assert lab['final'] == [(0.0, 3.0)] and lab['reviewed'] is True, lab
+
+
+def test_pool_embeddings():
+    emb = np.zeros((5, 1024), np.float32)
+    emb[0, 0], emb[1, 0], emb[4, 1] = 1.0, 3.0, 9.0
+    p = fs._pool_embeddings(emb)
+    assert p.shape == (3, 1024) and p.dtype == np.uint8, p.shape
+    assert p[0, 0] == round(2.0 * fs.EMBED_SCALE) and p[2, 1] == 255, (p[0, 0], p[2, 1])  # mean, clipped
+
+
 def test_decide_min_len_and_still_frames():
     # 2 s burst is shorter than min_len; the rest is a still picture (title card)
     an = _fake_analysis(120, motion_fn=lambda x: 0.05 if 50 <= x < 52 else 0.0005)
@@ -194,6 +289,11 @@ def test_end_to_end(tmp_path: Path):
     assert np.array_equal(an2['motion'], an['motion'])
     assert len(list(cache_dir.glob('*.features.npz'))) == 1
 
+    # YAMNet embeddings stored next to it, one per 0.96 s
+    emb = fs.load_embeddings(str(vid), cache_dir=str(cache_dir))
+    assert emb is not None and emb[0].shape[1] == 1024 and abs(len(emb[0]) - 150 / 0.96) <= 2, emb[0].shape
+    assert abs(emb[1][-1] - 150) < 2, emb[1][-1]
+
     # Exports
     xml = fs.export_davinci(str(vid), segs, an['meta']['fps'], str(tmp_path), 'xml')
     edl = fs.export_davinci(str(vid), segs, an['meta']['fps'], str(tmp_path), 'edl')
@@ -229,6 +329,12 @@ def main() -> int:
         test_overrides,
         test_settings_roundtrip,
         test_decide_motion_vocal_speech,
+        test_score_mode,
+        test_block_path,
+        test_blocks_mode,
+        test_override_helpers,
+        test_labels_and_export_record,
+        test_pool_embeddings,
         test_decide_min_len_and_still_frames,
         test_end_to_end,
         test_cancel,
