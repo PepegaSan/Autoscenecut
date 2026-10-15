@@ -428,8 +428,9 @@ class App:
                 ('classic', 'klassisch', 'Bewegung ODER Stimme reicht zum Behalten, jeder Dialog-Treffer schneidet raus.'),
                 ('extend', 'kombiniert', 'Die Regler unten wählen wie klassisch aus, WELCHE Szenen bleiben '
                                          '(z. B. mit „Highlights“). Danach wird jede davon auf die ganze Action '
-                                         'drumherum verlängert: so weit, wie die Bewegung über 30 s gemittelt hoch '
-                                         'bleibt oder Stimme weitergeht – Gerede mittendrin beendet die Szene nicht.')):
+                                         'drumherum verlängert: so weit, wie die Bewegung rhythmisch bleibt (gelbe '
+                                         'Linie) oder Stimme weitergeht – Gerede mittendrin beendet die Szene nicht. '
+                                         'Ausgewählte Stellen ganz ohne Rhythmus fliegen raus.')):
             rb = ttk.Radiobutton(modes, text=text, value=val, variable=self.v['decision'], style='Card.TRadiobutton',
                                  command=self._changed)
             rb.pack(side='left', padx=(0, 6))
@@ -603,7 +604,7 @@ class App:
         self.motion_scale.state(['disabled'] if auto else ['!disabled'])
         extend = self.v['decision'].get() != 'classic'
         self.strict_scale.state(['!disabled'] if extend else ['disabled'])
-        self.strict_hint.configure(text='höher = Szenen weniger weit verlängern (gelbe Linie in „Bewegung“)'
+        self.strict_hint.configure(text='höher = Szenen weniger weit verlängern (gelbe Rhythmus-Linie in „Bewegung“)'
                                    if extend else 'Strenge gilt nur für „kombiniert“')
 
     def _changed(self):
@@ -857,7 +858,7 @@ class App:
         if on:
             ly = y1 - res['motion_line'] / 100 * (y1 - y0)
             cv.create_line(x0, ly, x1, ly, fill=C['text'], dash=(4, 3))
-        # Combined mode: the 30 s motion the scenes grow along, and where it stops counting
+        # Combined mode: the rhythm the scenes grow along, and where it stops counting
         if 'region' in res['curves']:
             reg = per_px(res['curves']['region'], 'mean')
             pts = []
@@ -934,7 +935,7 @@ class App:
         elif any(a <= t < b for a, b in gone):
             txt += ' (klassisch: bleibt)'
         if 'region' in c:
-            txt += f"   Bewegung 30 s {c['region'][i]:.0f}"
+            txt += f"   Rhythmus {c['region'][i]:.0f}"
         txt += f"   Bewegung {c['motion'][i]:.0f}"
         if it.an['meta'].get('has_audio'):
             txt += f"  Stimme {c['vocal'][i]:.0f}  Sprache {c['speech'][i]:.0f}"

@@ -13,6 +13,12 @@ Usage:
     python evaluate.py --sweep              # combined mode at several strictness levels
     python evaluate.py --preset Highlights  # start from an app preset instead of the saved settings
     python evaluate.py --settings other.json
+    python evaluate.py --kurzclips          # short clips cut from the fully reviewed videos
+
+--kurzclips: there are no reviewed short clips yet, so they are made from the reviewed films:
+10 and 20 min excerpts (half overlapping) plus compilations of only the wanted (all action) or
+only the unwanted parts (all story). The signals are real, the answer is known. Judged by how
+much of each clip is decided right, grouped by how much of it is wanted.
 """
 import argparse
 import glob
@@ -75,6 +81,61 @@ def evaluate(an, s, gt):
     }
 
 
+SHORT_MINUTES = (10, 20)
+SHORT_BUCKETS = (('fast keine Action (0–20 % gewollt)', 0.0, 0.2), ('gemischt (20–80 %)', 0.2, 0.8),
+                 ('fast nur Action (80–100 %)', 0.8, 1.01))
+
+
+def _sub_analysis(an, idx):
+    """Analysis made of the frames idx (sorted); where pieces are joined there is a cut."""
+    sub = {k: an[k][idx].copy() for k in fs.VIDEO_KEYS + fs.AUDIO_KEYS}
+    joins = np.flatnonzero(np.diff(idx) > 1) + 1
+    sub['diff'][joins] = np.maximum(sub['diff'][joins], 0.3)
+    sub['meta'] = {**an['meta'], 'duration': len(idx) / fs.SAMPLE_FPS}
+    return sub
+
+
+def short_clips(videos):
+    """(name, analysis, wanted mask) for every made-up short clip of the fully reviewed videos."""
+    out = []
+    for name, an, (wanted, _a, _u, reviewed) in videos:
+        if not reviewed:
+            continue
+        n = len(wanted)
+        for mins in SHORT_MINUTES:
+            ln = int(mins * 60 * fs.SAMPLE_FPS)
+            for s in range(0, n - ln + 1, ln // 2):
+                idx = np.arange(s, s + ln)
+                out.append((f'{name[:12]} {mins} min ab {s / fs.SAMPLE_FPS / 60:.0f}', _sub_analysis(an, idx), wanted[idx]))
+            for tag, sel in (('nur Action', wanted), ('nur Story', ~wanted)):
+                pool = np.flatnonzero(sel)
+                for k in range(0, len(pool) - ln + 1, ln):
+                    idx = pool[k:k + ln]
+                    out.append((f'{name[:12]} {tag} {mins} min #{k // ln + 1}', _sub_analysis(an, idx), wanted[idx]))
+    return out
+
+
+def report_short(clips, configs, verbose=False):
+    print(f'{len(clips)} Kurzclips aus den komplett geprüften Videos. Spalten je Gruppe: '
+          'behalten (Ø) | richtig entschieden (Ø)\n')
+    print(' ' * 16 + ''.join(f'{b[0]:>38s}' for b in SHORT_BUCKETS))
+    for cname, s in configs:
+        rows = []
+        for name, an, wanted in clips:
+            kept = mask_from_spans(fs.decide(an, s)['segments'], len(wanted))
+            rows.append((name, wanted.mean(), kept.mean(), (kept == wanted).mean()))
+            if verbose:
+                print(f'    {name:34s} gewollt {rows[-1][1] * 100:3.0f} %  behalten {rows[-1][2] * 100:3.0f} %  '
+                      f'richtig {rows[-1][3] * 100:3.0f} %')
+        cells = []
+        for _b, lo, hi in SHORT_BUCKETS:
+            sel = [r for r in rows if lo <= r[1] < hi]
+            cells.append(f'{np.mean([r[2] for r in sel]) * 100:5.0f} % | {np.mean([r[3] for r in sel]) * 100:3.0f} % (n={len(sel):2d})'
+                         if sel else '–')
+        print(f'  {cname:14s}' + ''.join(f'{c:>38s}' for c in cells))
+    return 0
+
+
 def fmt(v):
     return '   –  ' if v != v else f'{v:5.0f}%'
 
@@ -86,6 +147,8 @@ def main():
     ap.add_argument('--cache', default=None)
     ap.add_argument('--sweep', action='store_true', help='combined mode at strictness 20 … 80')
     ap.add_argument('--preset', default=None, help='app preset as the base (Highlights, Standard, Großzügig)')
+    ap.add_argument('--kurzclips', action='store_true', help='short clips cut from the fully reviewed videos')
+    ap.add_argument('--einzeln', action='store_true', help='with --kurzclips: one line per clip')
     args = ap.parse_args()
 
     try:
@@ -117,6 +180,8 @@ def main():
                                                                           'strictness': lv})))
 
     print(f'Einstellungen: {args.preset or args.settings}')
+    if args.kurzclips:
+        return report_short(short_clips(videos), configs, args.einzeln)
     print('Spalten: gewollt behalten | akzeptiert behalten | ungewollt entfernt | behalten gesamt | '
           'davon ungeprüft neu\n')
     totals = {name: {'w': [0, 0], 'a': [0, 0], 'u': [0, 0]} for name, _ in configs}

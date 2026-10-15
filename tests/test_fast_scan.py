@@ -25,12 +25,12 @@ def _overlap(segs, a, b):
     return sum(max(0.0, min(e, b) - max(s, a)) for s, e in segs)
 
 
-def _fake_analysis(seconds, motion_fn, vocal_fn=None, speech_fn=None, cuts_at=(), loud_fn=None):
+def _fake_analysis(seconds, motion_fn, vocal_fn=None, speech_fn=None, cuts_at=(), loud_fn=None, jitter=0.1):
     """Analysis dict like fs.analyze() returns, from per-second functions."""
     n = int(seconds * FPS)
     t = np.arange(n) / FPS
     rng = np.random.default_rng(1)
-    motion = np.array([motion_fn(x) for x in t]) * rng.uniform(0.9, 1.1, n)
+    motion = np.array([motion_fn(x) for x in t]) * rng.uniform(1 - jitter, 1 + jitter, n)
     diff = motion.copy()
     for c in cuts_at:
         diff[int(c * FPS)] = 0.3
@@ -126,31 +126,57 @@ def test_decide_motion_vocal_speech():
     assert segs == [], segs
 
 
+def _beat(x, base):
+    """Rhythmic motion as in action scenes: 1.5 repetitions per second."""
+    return base * (1 + 0.6 * np.sin(2 * np.pi * 1.5 * x))
+
+
+def test_motion_rhythm():
+    t = np.arange(1200) / FPS
+    rng = np.random.default_rng(3)
+    beat = _beat(t, 0.05) * rng.uniform(0.9, 1.1, len(t))
+    noise = 0.05 * rng.uniform(0.4, 1.6, 6000)
+    r_beat, r_noise = fs.motion_rhythm(beat), fs.motion_rhythm(noise)
+    # irregular motion (here: noise) sits around 0.23 like the unwanted parts of real films, just
+    # below the default threshold – over a few minutes it can wander above it
+    assert r_beat[300:900].min() > 0.5, r_beat[300:900].min()
+    assert np.median(r_noise) < fs.extend_level(50) and r_noise.max() < 0.3, (np.median(r_noise), r_noise.max())
+    # a busier production (all motion 1.6 times higher) has exactly the same rhythm
+    assert np.allclose(fs.motion_rhythm(beat * 1.6), r_beat)
+    assert fs.motion_rhythm(np.full(50, 0.01)).tolist() == [0.0] * 50  # shorter than one window
+
+
 def test_extend_mode():
-    # Two action scenes of moderate motion, each with a short burst of strong motion (the part a
-    # strict classic setting finds): 60–240 s with a burst 120–130, 300–400 s with a burst
-    # 350–360. Inside the first scene a calm 40 s stretch with talk (150–190). 520–570 s: the
-    # same moderate motion but no burst – nothing picked it, so it must not grow into a scene.
+    # Rhythmic action scenes, each with a short burst of strong motion (the part a strict
+    # classic setting finds): 60–300 s with a burst 120–130 and 80 s of calm talk 160–240,
+    # 450–550 s with a burst 500–510. 700–760 s: the same rhythmic motion but no burst – nothing
+    # picked it, so it must not grow into a scene. 950–960 s: very strong but irregular motion –
+    # classic picks it, the combined mode drops it. Everything else: an almost still picture.
     def motion(x):
-        if 120 <= x < 130 or 350 <= x < 360:
-            return 0.2
-        if 150 <= x < 190:
+        if 120 <= x < 130 or 500 <= x < 510:
+            return _beat(x, 0.2)
+        if 950 <= x < 960:
+            return 0.3 * np.random.default_rng(int(x * FPS)).uniform(0.4, 1.6)
+        if 160 <= x < 240:
             return 0.012
-        return 0.05 if (60 <= x < 240 or 300 <= x < 400 or 520 <= x < 570) else 0.01
-    an = _fake_analysis(600, motion_fn=motion, speech_fn=lambda x: 0.8 if 150 <= x < 190 else 0.0)
+        return _beat(x, 0.05) if (60 <= x < 300 or 450 <= x < 550 or 700 <= x < 760) else 0.01
+    an = _fake_analysis(1200, motion_fn=motion, speech_fn=lambda x: 0.8 if 160 <= x < 240 else 0.0, jitter=0.0)
     base = dict(motion_level=95, vocal_keep=False, speech_level=40, min_len_s=4, merge_gap_s=2)
     classic = fs.decide(an, fs.Settings(**base))
-    assert _overlap(classic['segments'], 115, 135) > 8 and _overlap(classic['segments'], 60, 110) == 0, classic['segments']
-    res = fs.decide(an, fs.Settings(**base, decision='extend', strictness=50, scene_gap_s=45))
+    assert _overlap(classic['segments'], 115, 135) > 8 and _overlap(classic['segments'], 950, 960) > 8, classic['segments']
+    assert _overlap(classic['segments'], 60, 110) == 0, classic['segments']
+    res = fs.decide(an, fs.Settings(**base, decision='extend', strictness=50, scene_gap_s=60))
     segs = res['segments']
-    assert _overlap(segs, 65, 235) > 160, f'first scene grows to its full length, talk included: {segs}'
-    assert _overlap(segs, 305, 395) > 85, segs
-    assert _overlap(segs, 520, 570) == 0 and _overlap(segs, 0, 50) == 0, segs
+    assert _overlap(segs, 65, 295) > 220, f'first scene grows to its full length, talk included: {segs}'
+    assert _overlap(segs, 455, 545) > 85, segs
+    assert _overlap(segs, 700, 760) == 0, f'rhythm without a pick stays out: {segs}'
+    assert _overlap(segs, 940, 970) == 0, f'a pick without rhythm is dropped: {segs}'
+    assert _overlap(segs, 0, 30) == 0 and _overlap(segs, 350, 400) == 0 and _overlap(segs, 1000, 1200) == 0, segs
     assert 'region' in res['curves'] and 0 <= res['region_line'] <= 100
-    # short allowed pauses: the calm talk ends the first scene
+    # short allowed pauses: the long calm talk ends the first scene
     short = fs.decide(an, fs.Settings(**base, decision='extend', strictness=50, scene_gap_s=5))['segments']
-    assert _overlap(short, 160, 180) == 0 and _overlap(short, 65, 140) > 70, short
-    assert _overlap(short, 200, 235) == 0, f'the rest after the pause has no pick of its own: {short}'
+    assert _overlap(short, 185, 215) == 0 and _overlap(short, 65, 150) > 80, short
+    assert _overlap(short, 250, 300) == 0, f'the rest after the pause has no pick of its own: {short}'
     # classic stays exactly as before, and old saved modes load as the combined one
     assert fs.decide(an, fs.Settings(**base, decision='classic'))['segments'] == classic['segments']
     assert fs.Settings.from_dict({'decision': 'score', 'block_s': 20}).decision == 'extend'
@@ -299,6 +325,7 @@ def main() -> int:
         test_overrides,
         test_settings_roundtrip,
         test_decide_motion_vocal_speech,
+        test_motion_rhythm,
         test_extend_mode,
         test_override_helpers,
         test_labels_and_export_record,

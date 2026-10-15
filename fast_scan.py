@@ -680,17 +680,53 @@ def save_overrides(video, overrides, cache_dir=None):
 
 # Combined mode ("kombiniert"): the classic decision picks WHICH scenes (it is good at that, but
 # keeps only their busiest seconds), then every picked piece grows to the action around it –
-# the stretch where the motion averaged over EXTEND_SMOOTH_S stays high or vocal sounds go on.
-# Talk in the middle of that stretch does not end it. Measured on the first fully reviewed
-# video: classic Highlights touched 14 of 20 wanted scenes but covered only 2–48 % of each.
-EXTEND_SMOOTH_S = 30.0
+# the stretch where the motion stays rhythmic (see motion_rhythm) or vocal sounds go on. Talk
+# in the middle of that stretch does not end it. Picks without rhythm around them are dropped.
+# Measured on the first fully reviewed video: classic Highlights touched 14 of 20 wanted scenes
+# but covered only 2–48 % of each.
+EXTEND_SMOOTH_S = 30.0  # vocal sounds are averaged over this long
 EXTEND_VOCAL = 0.4  # vocal sounds above this share of vocal_level keep a scene going
+
+# Rhythm: how strongly the motion repeats itself 0.5–5 times a second (max. autocorrelation of
+# the detrended log motion in 8 s windows, averaged over 60 s). A correlation does not depend on
+# picture size, brightness or how busy a production is, so unlike the motion level it means the
+# same in every video: in both reviewed films wanted scenes sit at ≈ 0.27–0.29, the rest at
+# ≈ 0.22–0.23 (AUC 0.77 / 0.78). The motion level only separated per video, which made the
+# combined mode keep ~45 % of every short clip, whatever was in it.
+RHYTHM_WIN_S = 8.0
+RHYTHM_LAGS = (2, 20)  # frames at SAMPLE_FPS: 0.2–2 s per repetition
+RHYTHM_DETREND = 5  # frames; removes the slow ups and downs, keeps the beat
+RHYTHM_SMOOTH_S = 60.0
+RHYTHM_PICK_MARGIN = 0.01  # a pick needs at least threshold + this much rhythm to count
+RHYTHM_SCALE = (0.1, 0.5)  # rhythm shown as 0..100 between these values (same for every video)
+
+
+def motion_rhythm(motion):
+    """Rhythm per frame on the SAMPLE_FPS grid (0 = irregular, up to ~0.6 = clear beat)."""
+    x = np.log(np.maximum(np.asarray(motion, np.float64), 1e-4))
+    x = x - rolling_mean(x, RHYTHM_DETREND)
+    n, w, hop = len(x), int(RHYTHM_WIN_S * SAMPLE_FPS), 5
+    if n <= w:
+        return np.zeros(n)
+    starts = np.arange(0, n - w, hop)
+    segs = np.lib.stride_tricks.sliding_window_view(x, w)[starts]
+    segs = segs - segs.mean(axis=1, keepdims=True)
+    energy = (segs ** 2).sum(axis=1) + 1e-12
+    best = np.full(len(starts), -1.0)
+    for lag in range(RHYTHM_LAGS[0], RHYTHM_LAGS[1] + 1):
+        best = np.maximum(best, (segs[:, :-lag] * segs[:, lag:]).sum(axis=1) / energy)
+    per_frame = np.interp(np.arange(n), starts + w // 2, best)
+    return rolling_mean(per_frame, int(RHYTHM_SMOOTH_S * SAMPLE_FPS))
 
 
 def extend_level(strictness):
-    """Strictness 0..100 → share of the video's (smoothed) motion that counts as quieter than
-    action: 0.3 (grow far) .. 0.7 (grow little)."""
-    return 0.3 + min(max(float(strictness), 0.0), 100.0) / 100.0 * 0.4
+    """Strictness 0..100 → rhythm a scene needs to keep growing: 0.20 (grow far) .. 0.28 (little)."""
+    return 0.20 + min(max(float(strictness), 0.0), 100.0) / 100.0 * 0.08
+
+
+def rhythm_display(r):
+    lo, hi = RHYTHM_SCALE
+    return np.clip((np.asarray(r, np.float64) - lo) / (hi - lo) * 100.0, 0, 100)
 
 
 def grow_to_regions(seed, region):
@@ -771,20 +807,25 @@ def decide(an, s, overrides=None):
     region_line = None
     if s.decision == 'extend' and n:
         # Seeds: the finished classic pieces (min length applied, so no blip grows a scene)
+        # Rhythm depends only on the motion: computed once per analysis, not per slider move
+        if 'rhythm' not in an or len(an['rhythm']) != n:
+            an['rhythm'] = motion_rhythm(an['motion'])
+        rhythm = an['rhythm']
+        rthr = extend_level(s.strictness)
         seed = np.zeros(n, bool)
         for a, b in segs:
-            seed[int(round(a * SAMPLE_FPS)):int(round(b * SAMPLE_FPS))] = True
-        ctx = rolling_mean(logm, int(EXTEND_SMOOTH_S * SAMPLE_FPS))
-        cthr = float(np.quantile(ctx, extend_level(s.strictness)))
-        region = ctx > cthr
+            a, b = int(round(a * SAMPLE_FPS)), int(round(b * SAMPLE_FPS))
+            if b > a and rhythm[a:b].mean() >= rthr + RHYTHM_PICK_MARGIN:
+                seed[a:b] = True
+        region = rhythm > rthr
         if an['meta'].get('has_audio') and s.vocal_keep:
             vocal_ctx = rolling_mean(an['vocal'], int(EXTEND_SMOOTH_S * SAMPLE_FPS)) * 100.0
             region |= vocal_ctx > s.vocal_level * EXTEND_VOCAL
         region = fill_gaps(region, int(s.scene_gap_s * SAMPLE_FPS))
         keep = grow_to_regions(seed, region)
         segs = _to_segments(keep, cuts, s, duration)
-        curves['region'] = np.clip((ctx - lo_v) * scale, 0, 100)
-        region_line = float(np.clip((cthr - lo_v) * scale, 0, 100))
+        curves['region'] = rhythm_display(rhythm)
+        region_line = float(rhythm_display(rthr))
 
     if overrides:
         segs = apply_overrides(segs, overrides, duration)
@@ -793,7 +834,7 @@ def decide(an, s, overrides=None):
         'segments': segs, 'curves': curves, 'masks': masks, 'keep': keep, 'cuts': cuts,
         'auto_motion_level': auto_level, 'motion_level': level, 'overrides': list(overrides or []),
         'motion_line': float(np.clip((thr - lo_v) * scale, 0, 100)),  # threshold on the display scale
-        'region_line': region_line,  # combined mode: where the 30 s motion still counts as action
+        'region_line': region_line,  # combined mode: where the rhythm still counts as action
         'stats': {'kept_sec': kept, 'duration': duration, 'share': kept / max(duration, 1e-6),
                   'segments': len(segs), 'cuts': int(len(cuts))},
     }
