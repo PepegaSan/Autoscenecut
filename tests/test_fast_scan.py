@@ -237,6 +237,10 @@ def test_labels_and_export_record(tmp_path: Path):
     _p = fs._side_path(str(other), 'labels.json', c)
     Path(_p).write_text('{"final": [[1, 2]], "reviewed": true}', encoding='utf-8')
     assert fs.load_labels(str(other), c, 'extend')['final'] == [(1.0, 2.0)] and fs.load_labels(str(other), c, 'classic') is None
+    # ... and the old corrections next to it came from that read-back: not for classic
+    Path(fs._overrides_path(str(other), c)).write_text('[[1, 2, "keep"]]', encoding='utf-8')
+    assert fs.load_overrides(str(other), c, 'extend') == [(1.0, 2.0, 'keep')]
+    assert fs.load_overrides(str(other), c, 'classic') == []
     assert fs.load_video_settings(str(vid), c) is None
     fs.save_video_settings(str(vid), fs.Settings(decision='extend', strictness=70), cache_dir=c)
     assert fs.load_video_settings(str(vid), c) == fs.Settings(decision='extend', strictness=70)

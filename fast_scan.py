@@ -600,9 +600,9 @@ def edit_to_overrides(exported, final, min_len=0.3):
 # A video can be cut in both modes and the two cuts mean different things (classic: the
 # highlights, combined: whole scenes), so labels and corrections are kept per mode:
 # <name>.labels.<mode>.json, <name>.overrides.<mode>.json. The older files without a mode
-# (labels.json, overrides.json) are still read: labels for the mode stored in them (none =
-# combined, the first reviewed cuts were scene cuts), corrections for both modes until that
-# mode gets its own.
+# (labels.json, overrides.json) are still read for the mode stored in labels.json (none =
+# combined, the first reviewed cuts were scene cuts) – the corrections came from that same
+# read-back. Old corrections without any labels.json count for both modes until a mode gets its own.
 MODES = ('classic', 'extend')
 
 
@@ -660,7 +660,7 @@ def _read_labels(video, decision, cache_dir=None):
     d = _read_json(_side_path(video, f'labels.{mode}.json', cache_dir))
     if not isinstance(d, dict):
         d = _read_json(_side_path(video, 'labels.json', cache_dir))
-        if not isinstance(d, dict) or mode_of(d.get('decision') or 'extend') != mode:
+        if not isinstance(d, dict) or _legacy_mode(video, cache_dir) != mode:
             return None
     d['decision'] = mode
     return d
@@ -697,9 +697,18 @@ def load_video_settings(video, cache_dir=None):
     return Settings.from_dict(d) if isinstance(d, dict) else None
 
 
+def _legacy_mode(video, cache_dir=None):
+    """Mode the older files without a mode belong to; None = no old labels, so both."""
+    d = _read_json(_side_path(video, 'labels.json', cache_dir))
+    return mode_of(d.get('decision') or 'extend') if isinstance(d, dict) else None
+
+
 def load_overrides(video, cache_dir=None, decision='extend'):
-    """Manual corrections of this mode (the older file without a mode until it has its own)."""
-    for path in (_overrides_path(video, cache_dir, decision), _overrides_path(video, cache_dir)):
+    """Manual corrections of this mode (see MODES for the older file without a mode)."""
+    paths = [_overrides_path(video, cache_dir, decision)]
+    if _legacy_mode(video, cache_dir) in (None, mode_of(decision)):
+        paths.append(_overrides_path(video, cache_dir))
+    for path in paths:
         try:
             with open(path, encoding='utf-8') as f:
                 return [(float(a), float(b), str(m)) for a, b, m in json.load(f)]
@@ -712,7 +721,8 @@ def load_overrides(video, cache_dir=None, decision='extend'):
 
 def save_overrides(video, overrides, cache_dir=None, decision='extend'):
     path = _overrides_path(video, cache_dir, decision)
-    if not overrides and not os.path.isfile(_overrides_path(video, cache_dir)):
+    legacy = os.path.isfile(_overrides_path(video, cache_dir)) and _legacy_mode(video, cache_dir) in (None, mode_of(decision))
+    if not overrides and not legacy:
         try:
             os.remove(path)
         except OSError:
