@@ -106,8 +106,24 @@ class Item:
         self.an = None
         self.res = None
         self.error = ''
-        self.overrides = []  # manual corrections: (start, end, 'keep' | 'drop')
+        self.ov = {}  # manual corrections per mode (fs.MODES): [(start, end, 'keep' | 'drop'), ...]
         self.s = None  # own slider settings (fs.Settings), set when first shown
+
+    @property
+    def mode(self):
+        return fs.mode_of(self.s.decision if self.s is not None else 'extend')
+
+    def overrides_for(self, decision):
+        return self.ov.get(fs.mode_of(decision), [])
+
+    @property
+    def overrides(self):
+        """Corrections of the mode shown now: a classic and a combined cut mean different things."""
+        return self.overrides_for(self.mode)
+
+    @overrides.setter
+    def overrides(self, value):
+        self.ov[self.mode] = list(value)
 
 
 class App:
@@ -628,7 +644,7 @@ class App:
             if self.s.decision != 'classic':
                 # What changes against the classic decision: the places worth a look
                 classic = fs.Settings.from_dict({**self.s.to_dict(), 'decision': 'classic'})
-                old = fs.decide(it.an, classic, it.overrides)['segments']
+                old = fs.decide(it.an, classic, it.overrides_for('classic'))['segments']
                 it.res['vs_classic'] = (fs.spans_minus(it.res['segments'], old, 0.5),
                                         fs.spans_minus(old, it.res['segments'], 0.5))
             if self.s.motion_level < 0:
@@ -1022,8 +1038,9 @@ class App:
         if it is None:
             return
         it.overrides = fs.set_override(it.overrides, a, b, mode)
-        fs.save_overrides(it.path, it.overrides)
-        fs.correct_labels(it.path, a, b, mode, it.an['meta']['duration'])  # a reviewed cut follows too
+        fs.save_overrides(it.path, it.overrides, decision=it.mode)
+        # a reviewed cut of this mode follows too
+        fs.correct_labels(it.path, a, b, mode, it.an['meta']['duration'], decision=it.mode)
         self._recompute()
         what = {'keep': 'bleibt immer drin', 'drop': 'fliegt immer raus', None: 'wieder automatisch'}[mode]
         self.status_var.set(f'{fmt_time(a)}–{fmt_time(b)} {what}')
@@ -1033,7 +1050,7 @@ class App:
         if it is None:
             return
         it.overrides = []
-        fs.save_overrides(it.path, [])
+        fs.save_overrides(it.path, [], decision=it.mode)
         self._recompute()
         self.status_var.set('Alle eigenen Festlegungen entfernt – wieder alles automatisch')
 
@@ -1114,7 +1131,7 @@ class App:
             self.events.put(('item', it))
         try:
             it.an = fs.analyze(it.path, progress=prog, cancel=self.cancel)
-            it.overrides = fs.load_overrides(it.path)
+            it.ov = {m: fs.load_overrides(it.path, decision=m) for m in fs.MODES}
             it.status = 'fertig'
         except fs.Cancelled:
             it.status = 'abgebrochen'
@@ -1128,7 +1145,7 @@ class App:
         written = []
         loaded = []
         for k, (it, settings) in enumerate(items, 1):
-            res = fs.decide(it.an, settings, it.overrides)
+            res = fs.decide(it.an, settings, it.overrides_for(settings.decision))
             if not res['segments']:
                 self.events.put(('status', f'{it.name}: nichts zu behalten – übersprungen'))
                 continue
@@ -1216,9 +1233,12 @@ class App:
         if answer is None:
             self.status_var.set('Übernehmen abgebrochen – nichts geändert.')
             return
+        # The edit belongs to the mode it was exported with, whatever is shown now
+        ov = it.overrides_for(decision)
         for a, b, mode in changes:
-            it.overrides = fs.set_override(it.overrides, a, b, mode)
-        fs.save_overrides(it.path, it.overrides)
+            ov = fs.set_override(ov, a, b, mode)
+        it.ov[fs.mode_of(decision)] = ov
+        fs.save_overrides(it.path, ov, decision=decision)
         fs.save_labels(it.path, final, reviewed=answer, source='davinci', note=f'{project} / {timeline}',
                        decision=decision)
         if it is self.current:

@@ -10,7 +10,8 @@ DaVinci is decided again WITHOUT the corrections, and compared with them:
 
 A reviewed cut answers the question of the mode it was exported with: an edit of a classic export
 keeps the highlights, one of a combined export whole scenes. Each such video only counts towards
-the totals of its own mode (cuts without a stored mode count as scenes – the first ones were).
+the totals of its own mode, a video cut in both modes once per mode (cuts without a stored
+mode count as scenes – the first ones were).
 
 Usage:
     python evaluate.py                      # classic vs. combined with the app's current settings
@@ -50,23 +51,15 @@ def mask_from_spans(spans, n):
     return m
 
 
-def target_mode(video, cache_dir=None):
-    """Mode a fully reviewed cut is meant for ('classic' / 'extend'), None if not fully reviewed."""
-    labels = fs.load_labels(video, cache_dir)
-    if not labels or not labels.get('reviewed'):
-        return None
-    rec = fs.load_export_record(video, cache_dir) or {}
-    return labels.get('decision') or rec.get('decision') or 'extend'
-
-
-def ground_truth(an, video, s, cache_dir=None):
-    """(wanted, accepted, unwanted) frame masks and whether the video was fully reviewed."""
+def ground_truth(an, video, s, cache_dir=None, decision=None):
+    """(wanted, accepted, unwanted) frame masks and whether the video was fully reviewed.
+    decision: the mode whose reviewed cut to use; None = only the corrections."""
     n = len(an['diff'])
-    labels = fs.load_labels(video, cache_dir)
-    overrides = fs.load_overrides(video, cache_dir)
+    labels = fs.load_labels(video, cache_dir, decision) if decision else None
     if labels and labels.get('reviewed'):
         wanted = mask_from_spans(labels['final'], n)
         return wanted, np.zeros(n, bool), ~wanted, True
+    overrides = fs.load_overrides(video, cache_dir, 'classic')
     keep_o = mask_from_spans([(a, b) for a, b, m in overrides if m == 'keep'], n)
     drop_o = mask_from_spans([(a, b) for a, b, m in overrides if m == 'drop'], n)
     wanted = keep_o & ~drop_o
@@ -174,12 +167,16 @@ def main():
 
     videos = []
     for npz in sorted(glob.glob(os.path.join(cache, '*.features.npz'))):
-        has_side = any(os.path.isfile(npz.replace('.features.npz', '.' + k)) for k in ('overrides.json', 'labels.json'))
-        if not has_side:
+        if not glob.glob(glob.escape(npz[:-len('features.npz')]) + '*.json'):
             continue
         an = load_cached(npz)
         video = an['meta']['video']
-        videos.append((os.path.basename(video), an, ground_truth(an, video, base, cache), target_mode(video, cache)))
+        # One entry per reviewed cut (a video can be cut in both modes), else one for its corrections
+        modes = [m for m in fs.MODES if (fs.load_labels(video, cache, m) or {}).get('reviewed')]
+        for m in modes:
+            videos.append((os.path.basename(video), an, ground_truth(an, video, base, cache, m), m))
+        if not modes and fs.load_overrides(video, cache, 'classic'):
+            videos.append((os.path.basename(video), an, ground_truth(an, video, base, cache), None))
     if not videos:
         print('Keine Videos mit Korrekturen im Cache:', cache)
         return 1

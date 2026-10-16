@@ -597,8 +597,22 @@ def edit_to_overrides(exported, final, min_len=0.3):
     return sorted(drops + keeps)
 
 
-def _overrides_path(video, cache_dir=None):
-    return _side_path(video, 'overrides.json', cache_dir)
+# A video can be cut in both modes and the two cuts mean different things (classic: the
+# highlights, combined: whole scenes), so labels and corrections are kept per mode:
+# <name>.labels.<mode>.json, <name>.overrides.<mode>.json. The older files without a mode
+# (labels.json, overrides.json) are still read: labels for the mode stored in them (none =
+# combined, the first reviewed cuts were scene cuts), corrections for both modes until that
+# mode gets its own.
+MODES = ('classic', 'extend')
+
+
+def mode_of(decision):
+    return 'classic' if decision == 'classic' else 'extend'
+
+
+def _overrides_path(video, cache_dir=None, decision=None):
+    return _side_path(video, 'overrides.json' if decision is None else f'overrides.{mode_of(decision)}.json',
+                      cache_dir)
 
 
 def _read_json(path):
@@ -631,34 +645,45 @@ def load_export_record(video, cache_dir=None):
     return d
 
 
-def save_labels(video, final, reviewed, source, note='', decision=None, cache_dir=None):
+def save_labels(video, final, reviewed, source, note='', decision='extend', cache_dir=None):
     """Ground truth for evaluation / training. reviewed=True: the whole video was looked at, so
     everything inside final is wanted and everything outside is not. reviewed=False: only the
     corrections (overrides) count. decision: the mode of the export that was edited – an edit of
     a classic export keeps the highlights, one of a combined export whole scenes."""
-    _write_json(_side_path(video, 'labels.json', cache_dir), {
+    _write_json(_side_path(video, f'labels.{mode_of(decision)}.json', cache_dir), {
         'final': [[round(a, 3), round(b, 3)] for a, b in final], 'reviewed': bool(reviewed),
-        'source': source, 'note': note, 'decision': decision, 'time': time.strftime('%Y-%m-%d %H:%M:%S')})
+        'source': source, 'note': note, 'decision': mode_of(decision), 'time': time.strftime('%Y-%m-%d %H:%M:%S')})
 
 
-def load_labels(video, cache_dir=None):
-    d = _read_json(_side_path(video, 'labels.json', cache_dir))
+def _read_labels(video, decision, cache_dir=None):
+    mode = mode_of(decision)
+    d = _read_json(_side_path(video, f'labels.{mode}.json', cache_dir))
     if not isinstance(d, dict):
-        return None
-    d['final'] = [(float(a), float(b)) for a, b in d.get('final', [])]
+        d = _read_json(_side_path(video, 'labels.json', cache_dir))
+        if not isinstance(d, dict) or mode_of(d.get('decision') or 'extend') != mode:
+            return None
+    d['decision'] = mode
     return d
 
 
-def correct_labels(video, a, b, mode, duration, cache_dir=None):
-    """A correction made in the app after a fully reviewed read-back also changes that final cut
-    (newest wins, like the overrides). Removing a correction leaves the final cut as it is."""
-    d = _read_json(_side_path(video, 'labels.json', cache_dir))
-    if not isinstance(d, dict) or not d.get('reviewed') or mode not in ('keep', 'drop'):
+def load_labels(video, cache_dir=None, decision='extend'):
+    """The cut read back for this mode (see MODES), or None."""
+    d = _read_labels(video, decision, cache_dir)
+    if d is not None:
+        d['final'] = [(float(a), float(b)) for a, b in d.get('final', [])]
+    return d
+
+
+def correct_labels(video, a, b, mode, duration, decision='extend', cache_dir=None):
+    """A correction made in the app after a fully reviewed read-back also changes that mode's
+    final cut (newest wins, like the overrides). Removing a correction leaves it as it is."""
+    d = _read_labels(video, decision, cache_dir)
+    if d is None or not d.get('reviewed') or mode not in ('keep', 'drop'):
         return False
     final = apply_overrides([tuple(x) for x in d.get('final', [])], [(a, b, mode)], duration)
     d['final'] = [[round(x, 3), round(y, 3)] for x, y in final]
     d['corrected'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    _write_json(_side_path(video, 'labels.json', cache_dir), d)
+    _write_json(_side_path(video, f'labels.{mode_of(decision)}.json', cache_dir), d)
     return True
 
 
@@ -672,22 +697,28 @@ def load_video_settings(video, cache_dir=None):
     return Settings.from_dict(d) if isinstance(d, dict) else None
 
 
-def load_overrides(video, cache_dir=None):
-    try:
-        with open(_overrides_path(video, cache_dir), encoding='utf-8') as f:
-            return [(float(a), float(b), str(m)) for a, b, m in json.load(f)]
-    except (OSError, ValueError, TypeError):
-        return []
+def load_overrides(video, cache_dir=None, decision='extend'):
+    """Manual corrections of this mode (the older file without a mode until it has its own)."""
+    for path in (_overrides_path(video, cache_dir, decision), _overrides_path(video, cache_dir)):
+        try:
+            with open(path, encoding='utf-8') as f:
+                return [(float(a), float(b), str(m)) for a, b, m in json.load(f)]
+        except OSError:
+            continue
+        except (ValueError, TypeError):
+            return []
+    return []
 
 
-def save_overrides(video, overrides, cache_dir=None):
-    path = _overrides_path(video, cache_dir)
-    if not overrides:
+def save_overrides(video, overrides, cache_dir=None, decision='extend'):
+    path = _overrides_path(video, cache_dir, decision)
+    if not overrides and not os.path.isfile(_overrides_path(video, cache_dir)):
         try:
             os.remove(path)
         except OSError:
             pass
         return
+    # Empty but an old file without a mode exists: "[]" keeps it from coming back for this mode
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump([[round(a, 2), round(b, 2), m] for a, b, m in overrides], f)

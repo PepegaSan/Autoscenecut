@@ -93,6 +93,16 @@ def test_overrides(tmp_path: Path):
     assert fs.load_overrides(str(vid), cache_dir=str(tmp_path)) == [(10.0, 12.0, 'keep')]
     fs.save_overrides(str(vid), [], cache_dir=str(tmp_path))
     assert fs.load_overrides(str(vid), cache_dir=str(tmp_path)) == []
+    # per mode; an older file without a mode counts for both until a mode has its own
+    c = str(tmp_path)
+    fs.save_overrides(str(vid), [(1.0, 2.0, 'drop')], cache_dir=c, decision='classic')
+    assert fs.load_overrides(str(vid), c, 'classic') == [(1.0, 2.0, 'drop')] and fs.load_overrides(str(vid), c) == []
+    legacy = fs._overrides_path(str(vid), c)
+    Path(legacy).write_text('[[5, 6, "keep"]]', encoding='utf-8')
+    assert fs.load_overrides(str(vid), c, 'extend') == [(5.0, 6.0, 'keep')]
+    assert fs.load_overrides(str(vid), c, 'classic') == [(1.0, 2.0, 'drop')]
+    fs.save_overrides(str(vid), [], cache_dir=c, decision='classic')
+    assert fs.load_overrides(str(vid), c, 'classic') == [], 'emptied stays empty, the old file does not come back'
 
 
 def test_settings_roundtrip():
@@ -203,18 +213,30 @@ def test_labels_and_export_record(tmp_path: Path):
     fs.save_export_record(str(vid), [(1.0, 2.5)], True, 'DaVinci: tl', decision='classic', cache_dir=c)
     rec = fs.load_export_record(str(vid), c)
     assert rec['segments'] == [(1.0, 2.5)] and rec['full_length'] is True and rec['decision'] == 'classic', rec
-    assert not fs.correct_labels(str(vid), 1.0, 2.0, 'drop', 10.0, cache_dir=c)  # no labels yet
+    assert not fs.correct_labels(str(vid), 1.0, 2.0, 'drop', 10.0, 'classic', cache_dir=c)  # no labels yet
     fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=True, source='davinci', decision='classic', cache_dir=c)
-    lab = fs.load_labels(str(vid), c)
+    lab = fs.load_labels(str(vid), c, 'classic')
     assert lab['final'] == [(0.0, 3.0)] and lab['reviewed'] is True and lab['decision'] == 'classic', lab
-    # corrections made in the app afterwards change the reviewed cut too; removing one does not
-    assert fs.correct_labels(str(vid), 2.0, 5.0, 'drop', 10.0, cache_dir=c)
-    assert fs.correct_labels(str(vid), 6.0, 7.0, 'keep', 10.0, cache_dir=c)
-    assert not fs.correct_labels(str(vid), 0.0, 10.0, None, 10.0, cache_dir=c)
-    lab = fs.load_labels(str(vid), c)
+    assert fs.load_labels(str(vid), c, 'extend') is None, 'a classic cut is not a scene cut'
+    # corrections made in the app afterwards change that mode's reviewed cut too; removing one does not
+    assert fs.correct_labels(str(vid), 2.0, 5.0, 'drop', 10.0, 'classic', cache_dir=c)
+    assert fs.correct_labels(str(vid), 6.0, 7.0, 'keep', 10.0, 'classic', cache_dir=c)
+    assert not fs.correct_labels(str(vid), 0.0, 10.0, None, 10.0, 'classic', cache_dir=c)
+    assert not fs.correct_labels(str(vid), 0.0, 1.0, 'drop', 10.0, 'extend', cache_dir=c)
+    lab = fs.load_labels(str(vid), c, 'classic')
     assert lab['final'] == [(0.0, 2.0), (6.0, 7.0)] and lab['decision'] == 'classic', lab
-    fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=False, source='davinci', cache_dir=c)
-    assert not fs.correct_labels(str(vid), 0.0, 1.0, 'drop', 10.0, cache_dir=c)  # only corrections count there
+    # the scene cut of the same video lives next to it
+    fs.save_labels(str(vid), [(0.0, 9.0)], reviewed=True, source='davinci', decision='extend', cache_dir=c)
+    assert fs.load_labels(str(vid), c, 'extend')['final'] == [(0.0, 9.0)]
+    assert fs.load_labels(str(vid), c, 'classic')['final'] == [(0.0, 2.0), (6.0, 7.0)]
+    fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=False, source='davinci', decision='classic', cache_dir=c)
+    assert not fs.correct_labels(str(vid), 0.0, 1.0, 'drop', 10.0, 'classic', cache_dir=c)  # only corrections count there
+    # an older labels.json without a mode is a scene cut
+    other = Path(tmp_path) / 'w.mp4'
+    other.write_bytes(b'y')
+    _p = fs._side_path(str(other), 'labels.json', c)
+    Path(_p).write_text('{"final": [[1, 2]], "reviewed": true}', encoding='utf-8')
+    assert fs.load_labels(str(other), c, 'extend')['final'] == [(1.0, 2.0)] and fs.load_labels(str(other), c, 'classic') is None
     assert fs.load_video_settings(str(vid), c) is None
     fs.save_video_settings(str(vid), fs.Settings(decision='extend', strictness=70), cache_dir=c)
     assert fs.load_video_settings(str(vid), c) == fs.Settings(decision='extend', strictness=70)
