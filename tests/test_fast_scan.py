@@ -151,7 +151,8 @@ def test_extend_mode():
     # classic setting finds): 60–300 s with a burst 120–130 and 80 s of calm talk 160–240,
     # 450–550 s with a burst 500–510. 700–760 s: the same rhythmic motion but no burst – nothing
     # picked it, so it must not grow into a scene. 950–960 s: very strong but irregular motion –
-    # classic picks it, the combined mode drops it. Everything else: an almost still picture.
+    # classic picks it, the combined mode drops it. 1030–1180 s: rhythmic for minutes without a
+    # pick – a scene of its own. Everything else: an almost still picture.
     def motion(x):
         if 120 <= x < 130 or 500 <= x < 510:
             return _beat(x, 0.2)
@@ -159,7 +160,7 @@ def test_extend_mode():
             return 0.3 * np.random.default_rng(int(x * FPS)).uniform(0.4, 1.6)
         if 160 <= x < 240:
             return 0.012
-        return _beat(x, 0.05) if (60 <= x < 300 or 450 <= x < 550 or 700 <= x < 760) else 0.01
+        return _beat(x, 0.05) if (60 <= x < 300 or 450 <= x < 550 or 700 <= x < 760 or 1030 <= x < 1180) else 0.01
     an = _fake_analysis(1200, motion_fn=motion, speech_fn=lambda x: 0.8 if 160 <= x < 240 else 0.0, jitter=0.0)
     base = dict(motion_level=95, vocal_keep=False, speech_level=40, min_len_s=4, merge_gap_s=2)
     classic = fs.decide(an, fs.Settings(**base))
@@ -171,7 +172,8 @@ def test_extend_mode():
     assert _overlap(segs, 455, 545) > 85, segs
     assert _overlap(segs, 700, 760) == 0, f'rhythm without a pick stays out: {segs}'
     assert _overlap(segs, 940, 970) == 0, f'a pick without rhythm is dropped: {segs}'
-    assert _overlap(segs, 0, 30) == 0 and _overlap(segs, 350, 400) == 0 and _overlap(segs, 1000, 1200) == 0, segs
+    assert _overlap(segs, 1040, 1170) > 125, f'minutes of clear rhythm count without a pick: {segs}'
+    assert _overlap(segs, 0, 30) == 0 and _overlap(segs, 350, 400) == 0 and _overlap(segs, 970, 1010) == 0, segs
     assert 'region' in res['curves'] and 0 <= res['region_line'] <= 100
     # short allowed pauses: the long calm talk ends the first scene
     short = fs.decide(an, fs.Settings(**base, decision='extend', strictness=50, scene_gap_s=5))['segments']
@@ -198,12 +200,21 @@ def test_labels_and_export_record(tmp_path: Path):
     vid.write_bytes(b'x')
     c = str(tmp_path)
     assert fs.load_labels(str(vid), c) is None and fs.load_export_record(str(vid), c) is None
-    fs.save_export_record(str(vid), [(1.0, 2.5)], True, 'DaVinci: tl', cache_dir=c)
+    fs.save_export_record(str(vid), [(1.0, 2.5)], True, 'DaVinci: tl', decision='classic', cache_dir=c)
     rec = fs.load_export_record(str(vid), c)
-    assert rec['segments'] == [(1.0, 2.5)] and rec['full_length'] is True, rec
-    fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=True, source='davinci', cache_dir=c)
+    assert rec['segments'] == [(1.0, 2.5)] and rec['full_length'] is True and rec['decision'] == 'classic', rec
+    assert not fs.correct_labels(str(vid), 1.0, 2.0, 'drop', 10.0, cache_dir=c)  # no labels yet
+    fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=True, source='davinci', decision='classic', cache_dir=c)
     lab = fs.load_labels(str(vid), c)
-    assert lab['final'] == [(0.0, 3.0)] and lab['reviewed'] is True, lab
+    assert lab['final'] == [(0.0, 3.0)] and lab['reviewed'] is True and lab['decision'] == 'classic', lab
+    # corrections made in the app afterwards change the reviewed cut too; removing one does not
+    assert fs.correct_labels(str(vid), 2.0, 5.0, 'drop', 10.0, cache_dir=c)
+    assert fs.correct_labels(str(vid), 6.0, 7.0, 'keep', 10.0, cache_dir=c)
+    assert not fs.correct_labels(str(vid), 0.0, 10.0, None, 10.0, cache_dir=c)
+    lab = fs.load_labels(str(vid), c)
+    assert lab['final'] == [(0.0, 2.0), (6.0, 7.0)] and lab['decision'] == 'classic', lab
+    fs.save_labels(str(vid), [(0.0, 3.0)], reviewed=False, source='davinci', cache_dir=c)
+    assert not fs.correct_labels(str(vid), 0.0, 1.0, 'drop', 10.0, cache_dir=c)  # only corrections count there
     assert fs.load_video_settings(str(vid), c) is None
     fs.save_video_settings(str(vid), fs.Settings(decision='extend', strictness=70), cache_dir=c)
     assert fs.load_video_settings(str(vid), c) == fs.Settings(decision='extend', strictness=70)

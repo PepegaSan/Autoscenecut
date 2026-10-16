@@ -430,7 +430,8 @@ class App:
                                          '(z. B. mit „Highlights“). Danach wird jede davon auf die ganze Action '
                                          'drumherum verlängert: so weit, wie die Bewegung rhythmisch bleibt (gelbe '
                                          'Linie) oder Stimme weitergeht – Gerede mittendrin beendet die Szene nicht. '
-                                         'Ausgewählte Stellen ganz ohne Rhythmus fliegen raus.')):
+                                         'Ausgewählte Stellen ganz ohne Rhythmus fliegen raus, minutenlang deutlich '
+                                         'rhythmische Stellen bleiben auch ohne Auswahl.')):
             rb = ttk.Radiobutton(modes, text=text, value=val, variable=self.v['decision'], style='Card.TRadiobutton',
                                  command=self._changed)
             rb.pack(side='left', padx=(0, 6))
@@ -1022,6 +1023,7 @@ class App:
             return
         it.overrides = fs.set_override(it.overrides, a, b, mode)
         fs.save_overrides(it.path, it.overrides)
+        fs.correct_labels(it.path, a, b, mode, it.an['meta']['duration'])  # a reviewed cut follows too
         self._recompute()
         what = {'keep': 'bleibt immer drin', 'drop': 'fliegt immer raus', None: 'wieder automatisch'}[mode]
         self.status_var.set(f'{fmt_time(a)}–{fmt_time(b)} {what}')
@@ -1141,7 +1143,8 @@ class App:
                         full_length=full_length, duration=it.an['meta']['duration'],
                         deliver=render_kbps != 0, render_kbps=render_kbps, render_dir=out_dir or None)
                     loaded.append(tl)
-                    fs.save_export_record(it.path, res['segments'], full_length, target=f'DaVinci: {tl}')
+                    fs.save_export_record(it.path, res['segments'], full_length, target=f'DaVinci: {tl}',
+                                          decision=settings.decision)
                     self.events.put(('progress', k / len(items), prefix + f'In DaVinci geladen: {tl}'))
                     continue
                 if kind == 'mp4':
@@ -1151,7 +1154,8 @@ class App:
                     path = fs.export_davinci(it.path, res['segments'], it.an['meta']['fps'], dest, kind,
                                              full_length=full_length, duration=it.an['meta']['duration'])
                     # Reference for reading the edit back once the file is imported into Resolve
-                    fs.save_export_record(it.path, res['segments'], full_length, target=path)
+                    fs.save_export_record(it.path, res['segments'], full_length, target=path,
+                                          decision=settings.decision)
             except fs.Cancelled:
                 self.events.put(('export_done', written, 'Export abgebrochen'))
                 return
@@ -1183,9 +1187,11 @@ class App:
         rec = fs.load_export_record(it.path)
         if rec is not None:
             exported, ref = rec['segments'], f"dem Export vom {rec.get('time', '?')}"
+            decision = rec.get('decision') or self._settings_of(it).decision
         else:
             res = it.res or fs.decide(it.an, self._settings_of(it), it.overrides)
             exported, ref = res['segments'], 'dem aktuellen Vorschlag (kein Export gespeichert)'
+            decision = self._settings_of(it).decision
         changes = fs.edit_to_overrides(exported, final)
         drops = [c for c in changes if c[2] == 'drop']
         keeps = [c for c in changes if c[2] == 'keep']
@@ -1213,7 +1219,8 @@ class App:
         for a, b, mode in changes:
             it.overrides = fs.set_override(it.overrides, a, b, mode)
         fs.save_overrides(it.path, it.overrides)
-        fs.save_labels(it.path, final, reviewed=answer, source='davinci', note=f'{project} / {timeline}')
+        fs.save_labels(it.path, final, reviewed=answer, source='davinci', note=f'{project} / {timeline}',
+                       decision=decision)
         if it is self.current:
             self._recompute()
         self.status_var.set(f'Aus DaVinci übernommen: {len(drops)} entfernt, {len(keeps)} dazugenommen'

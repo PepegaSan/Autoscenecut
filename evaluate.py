@@ -8,6 +8,10 @@ DaVinci is decided again WITHOUT the corrections, and compared with them:
             (only for videos that were not marked as fully reviewed)
 - unwanted: removed by you ('always cut', or outside the reviewed final cut)
 
+A reviewed cut answers the question of the mode it was exported with: an edit of a classic export
+keeps the highlights, one of a combined export whole scenes. Each such video only counts towards
+the totals of its own mode (cuts without a stored mode count as scenes – the first ones were).
+
 Usage:
     python evaluate.py                      # classic vs. combined with the app's current settings
     python evaluate.py --sweep              # combined mode at several strictness levels
@@ -17,7 +21,8 @@ Usage:
 
 --kurzclips: there are no reviewed short clips yet, so they are made from the reviewed films:
 10 and 20 min excerpts (half overlapping) plus compilations of only the wanted (all action) or
-only the unwanted parts (all story). The signals are real, the answer is known. Judged by how
+only the unwanted parts (all story), from the videos reviewed as whole scenes. The signals
+are real, the answer is known. Judged by how
 much of each clip is decided right, grouped by how much of it is wanted.
 """
 import argparse
@@ -43,6 +48,15 @@ def mask_from_spans(spans, n):
     for a, b in spans:
         m[int(round(a * fs.SAMPLE_FPS)):int(round(b * fs.SAMPLE_FPS))] = True
     return m
+
+
+def target_mode(video, cache_dir=None):
+    """Mode a fully reviewed cut is meant for ('classic' / 'extend'), None if not fully reviewed."""
+    labels = fs.load_labels(video, cache_dir)
+    if not labels or not labels.get('reviewed'):
+        return None
+    rec = fs.load_export_record(video, cache_dir) or {}
+    return labels.get('decision') or rec.get('decision') or 'extend'
 
 
 def ground_truth(an, video, s, cache_dir=None):
@@ -98,8 +112,8 @@ def _sub_analysis(an, idx):
 def short_clips(videos):
     """(name, analysis, wanted mask) for every made-up short clip of the fully reviewed videos."""
     out = []
-    for name, an, (wanted, _a, _u, reviewed) in videos:
-        if not reviewed:
+    for name, an, (wanted, _a, _u, reviewed), target in videos:
+        if not reviewed or target != 'extend':
             continue
         n = len(wanted)
         for mins in SHORT_MINUTES:
@@ -165,7 +179,7 @@ def main():
             continue
         an = load_cached(npz)
         video = an['meta']['video']
-        videos.append((os.path.basename(video), an, ground_truth(an, video, base, cache)))
+        videos.append((os.path.basename(video), an, ground_truth(an, video, base, cache), target_mode(video, cache)))
     if not videos:
         print('Keine Videos mit Korrekturen im Cache:', cache)
         return 1
@@ -185,22 +199,26 @@ def main():
     print('Spalten: gewollt behalten | akzeptiert behalten | ungewollt entfernt | behalten gesamt | '
           'davon ungeprüft neu\n')
     totals = {name: {'w': [0, 0], 'a': [0, 0], 'u': [0, 0]} for name, _ in configs}
-    for name, an, gt in videos:
+    for name, an, gt, target in videos:
         wanted, accepted, unwanted, rev = gt
-        print(f'{name[:60]}  ({"komplett geprüft" if rev else "nur Korrekturen"}; gewollt '
+        what = {None: 'nur Korrekturen', 'classic': 'komplett geprüft als Highlights (klassisch)',
+                'extend': 'komplett geprüft als ganze Szenen (kombiniert)'}[target]
+        print(f'{name[:60]}  ({what}; gewollt '
               f'{wanted.sum() / 600:.1f} min, akzeptiert {accepted.sum() / 600:.1f} min, '
               f'ungewollt {unwanted.sum() / 600:.1f} min)')
         for cname, s in configs:
             r = evaluate(an, s, gt)
             print(f'  {cname:14s} {fmt(r["wanted"])} {fmt(r["accepted"])} {fmt(r["unwanted_removed"])}'
                   f'   {r["kept_min"]:5.1f} min  {r["new_min"]:5.1f} min')
+            if target is not None and target != s.decision:
+                continue  # a cut for the other mode: shown, but not counted
             t = totals[cname]
             for key, rk, m in (('w', 'wanted', wanted), ('a', 'accepted', accepted), ('u', 'unwanted_removed', unwanted)):
                 if m.any():
                     t[key][0] += r[rk] / 100 * m.sum()
                     t[key][1] += m.sum()
         print()
-    print('Gesamt (zeitgewichtet):')
+    print('Gesamt (zeitgewichtet, jedes komplett geprüfte Video nur bei seinem Modus):')
     for cname, _s in configs:
         t = totals[cname]
         vals = [t[k][0] / t[k][1] * 100 if t[k][1] else float('nan') for k in ('w', 'a', 'u')]
