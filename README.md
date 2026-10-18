@@ -38,6 +38,12 @@ Manual alternative: `pip install -r requirements.txt`, then `python scenecut_app
    video's timeline back (read only) and turns what you deleted, trimmed or brought back into
    corrections. Every clip still in the timeline counts as kept, whatever its colour (also
    one half of a split clip); what you cut out or disable counts as removed.
+   *Wegen Geschmack* (test version): the same menu can say a correction was made because of
+   taste – how something is shown, not whether it is action (*Immer behalten / rausschneiden –
+   Geschmack*, or *Festlegung hier als Geschmack markieren* for one that is already there, e.g.
+   from DaVinci). It changes nothing in the cut; a pink bar above *Bleibt* shows it. The
+   general decision is measured without these parts, and they are collected for a personal taste
+   model later.
 5. **Export**
    - *Direkt in DaVinci laden*: new timeline in the open Resolve project (Resolve is started if
      needed; existing timelines are never touched)
@@ -98,6 +104,7 @@ python fast_scan.py VIDEO [--motion-level 60] [--speech remove|ignore|keep] [--e
 | `davinci_api.py` | Resolve connection (vendored from the Hail Mary project) |
 | `timeline_export.py` | FCP7 XML and CMX EDL files |
 | `evaluate.py` | measures the decision against your corrections |
+| `taste.py` | taste marks on corrections (test version) |
 | `yamnet.onnx`, `yamnet_class_map.csv` | sound classification model |
 
 ## Tests
@@ -106,6 +113,7 @@ python fast_scan.py VIDEO [--motion-level 60] [--speech remove|ignore|keep] [--e
 python tests/test_fast_scan.py
 python tests/test_davinci_timeline.py
 python tests/test_timeline_export.py
+python tests/test_taste.py
 ```
 
 No GPU or Resolve needed; the Resolve tests use a small fake of its object model.

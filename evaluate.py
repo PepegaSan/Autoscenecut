@@ -8,6 +8,9 @@ DaVinci is decided again WITHOUT the corrections, and compared with them:
             (only for videos that were not marked as fully reviewed)
 - unwanted: removed by you ('always cut', or outside the reviewed final cut)
 
+Parts marked as taste (taste.py: corrections made because of how something is shown, not whether
+it is action) count neither way: the general decision is not measured against taste.
+
 A reviewed cut answers the question of the mode it was exported with: an edit of a classic export
 keeps the highlights, one of a combined export whole scenes. Each such video only counts towards
 the totals of its own mode, a video cut in both modes once per mode (cuts without a stored
@@ -35,6 +38,7 @@ import sys
 import numpy as np
 
 import fast_scan as fs
+import taste
 
 
 def load_cached(npz):
@@ -52,13 +56,15 @@ def mask_from_spans(spans, n):
 
 
 def ground_truth(an, video, s, cache_dir=None, decision=None):
-    """(wanted, accepted, unwanted) frame masks and whether the video was fully reviewed.
+    """(wanted, accepted, unwanted, reviewed, taste) – frame masks, whether the video was fully
+    reviewed, and the frames marked as taste (left out of the other three).
     decision: the mode whose reviewed cut to use; None = only the corrections."""
     n = len(an['diff'])
+    marked = taste.mask(taste.load_marks(video, cache_dir, decision or 'classic'), n)
     labels = fs.load_labels(video, cache_dir, decision) if decision else None
     if labels and labels.get('reviewed'):
         wanted = mask_from_spans(labels['final'], n)
-        return wanted, np.zeros(n, bool), ~wanted, True
+        return wanted & ~marked, np.zeros(n, bool), ~wanted & ~marked, True, marked
     overrides = fs.load_overrides(video, cache_dir, 'classic')
     keep_o = mask_from_spans([(a, b) for a, b, m in overrides if m == 'keep'], n)
     drop_o = mask_from_spans([(a, b) for a, b, m in overrides if m == 'drop'], n)
@@ -68,11 +74,11 @@ def ground_truth(an, video, s, cache_dir=None, decision=None):
     classic = fs.Settings.from_dict({**s.to_dict(), 'decision': 'classic'})
     auto = mask_from_spans(fs.decide(an, classic)['segments'], n)
     accepted = auto & ~wanted & ~unwanted
-    return wanted, accepted, unwanted, False
+    return wanted & ~marked, accepted & ~marked, unwanted & ~marked, False, marked
 
 
 def evaluate(an, s, gt):
-    wanted, accepted, unwanted, _rev = gt
+    wanted, accepted, unwanted, _rev, _taste = gt
     n = len(an['diff'])
     kept = mask_from_spans(fs.decide(an, s)['segments'], n)
     labeled = wanted | accepted | unwanted
@@ -105,7 +111,7 @@ def _sub_analysis(an, idx):
 def short_clips(videos):
     """(name, analysis, wanted mask) for every made-up short clip of the fully reviewed videos."""
     out = []
-    for name, an, (wanted, _a, _u, reviewed), target in videos:
+    for name, an, (wanted, _a, unwanted, reviewed, _t), target in videos:
         if not reviewed or target != 'extend':
             continue
         n = len(wanted)
@@ -113,12 +119,14 @@ def short_clips(videos):
             ln = int(mins * 60 * fs.SAMPLE_FPS)
             for s in range(0, n - ln + 1, ln // 2):
                 idx = np.arange(s, s + ln)
-                out.append((f'{name[:12]} {mins} min ab {s / fs.SAMPLE_FPS / 60:.0f}', _sub_analysis(an, idx), wanted[idx]))
-            for tag, sel in (('nur Action', wanted), ('nur Story', ~wanted)):
+                out.append((f'{name[:12]} {mins} min ab {s / fs.SAMPLE_FPS / 60:.0f}', _sub_analysis(an, idx), wanted[idx],
+                            (wanted | unwanted)[idx]))
+            for tag, sel in (('nur Action', wanted), ('nur Story', unwanted)):
                 pool = np.flatnonzero(sel)
                 for k in range(0, len(pool) - ln + 1, ln):
                     idx = pool[k:k + ln]
-                    out.append((f'{name[:12]} {tag} {mins} min #{k // ln + 1}', _sub_analysis(an, idx), wanted[idx]))
+                    out.append((f'{name[:12]} {tag} {mins} min #{k // ln + 1}', _sub_analysis(an, idx), wanted[idx],
+                                (wanted | unwanted)[idx]))
     return out
 
 
@@ -128,9 +136,9 @@ def report_short(clips, configs, verbose=False):
     print(' ' * 16 + ''.join(f'{b[0]:>38s}' for b in SHORT_BUCKETS))
     for cname, s in configs:
         rows = []
-        for name, an, wanted in clips:
+        for name, an, wanted, valid in clips:
             kept = mask_from_spans(fs.decide(an, s)['segments'], len(wanted))
-            rows.append((name, wanted.mean(), kept.mean(), (kept == wanted).mean()))
+            rows.append((name, wanted[valid].mean(), kept.mean(), (kept == wanted)[valid].mean()))
             if verbose:
                 print(f'    {name:34s} gewollt {rows[-1][1] * 100:3.0f} %  behalten {rows[-1][2] * 100:3.0f} %  '
                       f'richtig {rows[-1][3] * 100:3.0f} %')
@@ -197,12 +205,13 @@ def main():
           'davon ungeprüft neu\n')
     totals = {name: {'w': [0, 0], 'a': [0, 0], 'u': [0, 0]} for name, _ in configs}
     for name, an, gt, target in videos:
-        wanted, accepted, unwanted, rev = gt
+        wanted, accepted, unwanted, rev, marked = gt
         what = {None: 'nur Korrekturen', 'classic': 'komplett geprüft als Highlights (klassisch)',
                 'extend': 'komplett geprüft als ganze Szenen (kombiniert)'}[target]
         print(f'{name[:60]}  ({what}; gewollt '
               f'{wanted.sum() / 600:.1f} min, akzeptiert {accepted.sum() / 600:.1f} min, '
-              f'ungewollt {unwanted.sum() / 600:.1f} min)')
+              f'ungewollt {unwanted.sum() / 600:.1f} min'
+              + (f', Geschmack {marked.sum() / 600:.1f} min nicht gewertet' if marked.any() else '') + ')')
         for cname, s in configs:
             r = evaluate(an, s, gt)
             print(f'  {cname:14s} {fmt(r["wanted"])} {fmt(r["accepted"])} {fmt(r["unwanted_removed"])}'

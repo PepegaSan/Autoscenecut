@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 import fast_scan as fs
+import taste
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -31,6 +32,7 @@ C = {
     'text': '#e8eaf0', 'muted': '#8a90a2', 'accent': '#00c8ff', 'accent_dim': '#0a5f7a',
     'keep': '#3ccf7a', 'keep_bg': '#1f4d35', 'motion': '#00c8ff', 'motion_off': '#153646', 'vocal': '#ffb74d', 'speech': '#c792ea', 'music': '#7f8cff',
     'cut': '#4a5068', 'error': '#ff8a80', 'drop': '#5a2a2a', 'new': '#ffe066', 'gone': '#b0b6c8',
+    'taste': '#ff7eb6',
 }
 FONT = ('Segoe UI', 10)
 FONT_B = ('Segoe UI Semibold', 10)
@@ -107,6 +109,7 @@ class Item:
         self.res = None
         self.error = ''
         self.ov = {}  # manual corrections per mode (fs.MODES): [(start, end, 'keep' | 'drop'), ...]
+        self.taste = {}  # per mode: the corrections made because of taste (see taste.py)
         self.s = None  # own slider settings (fs.Settings), set when first shown
 
     @property
@@ -124,6 +127,14 @@ class Item:
     @overrides.setter
     def overrides(self, value):
         self.ov[self.mode] = list(value)
+
+    @property
+    def marks(self):
+        return self.taste.get(self.mode, [])
+
+    @marks.setter
+    def marks(self, value):
+        self.taste[self.mode] = list(value)
 
 
 class App:
@@ -395,6 +406,9 @@ class App:
             sq = tk.Label(hint_row, text='▬', fg=color, bg=C['panel'], font=FONT)
             lbl = ttk.Label(hint_row, text=text + '    ', style='Muted.TLabel')
             self.cmp_legend.append((sq, lbl))
+        # Only with taste marks: the bar above "Bleibt"
+        self.taste_legend = (tk.Label(hint_row, text='▬', fg=C['taste'], bg=C['panel'], font=FONT),
+                             ttk.Label(hint_row, text='rosa Strich = wegen Geschmack    ', style='Muted.TLabel'))
         how = ttk.Frame(right, style='Panel.TFrame')
         how.grid(row=4, column=0, sticky='ew')
         ttk.Label(how, text='Klick = ab dort abspielen  ·  Ziehen / Rechtsklick = selbst behalten oder rausschneiden',
@@ -856,6 +870,10 @@ class App:
                 cv.create_rectangle(xa, y0, max(xb, xa + 2), y1, outline='#ffffff', width=2)
             else:
                 cv.create_rectangle(xa, y0, max(xb, xa + 2), y1, fill=C['drop'], outline=C['error'], width=1)
+        # Corrections made because of taste: bar above the lane
+        for a, b, _mode in it.marks:
+            xa, xb = x0 + a / dur * (x1 - x0), x0 + b / dur * (x1 - x0)
+            cv.create_rectangle(xa, y0 - 5, max(xb, xa + 2), y0 - 1, fill=C['taste'], outline='')
         # Score mode: bar under the lane where it differs from the classic decision
         for spans_, color in zip(res.get('vs_classic', ()), (C['new'], C['gone'])):
             for a, b in spans_:
@@ -951,6 +969,8 @@ class App:
             txt += ' (neu ggü. klassisch)'
         elif any(a <= t < b for a, b in gone):
             txt += ' (klassisch: bleibt)'
+        if any(a <= t < b for a, b, _m in it.marks):
+            txt += ' · Geschmack'
         if 'region' in c:
             txt += f"   Rhythmus {c['region'][i]:.0f}"
         txt += f"   Bewegung {c['motion'][i]:.0f}"
@@ -1017,8 +1037,17 @@ class App:
         m.add_separator()
         m.add_command(label='Immer behalten', command=lambda: self._set_override(a, b, 'keep'))
         m.add_command(label='Immer rausschneiden', command=lambda: self._set_override(a, b, 'drop'))
-        if any(o_a < b and o_b > a for o_a, o_b, _m in it.overrides):
+        own = any(o_a < b and o_b > a for o_a, o_b, _m in it.overrides)
+        if own:
             m.add_command(label='Eigene Festlegung hier entfernen', command=lambda: self._set_override(a, b, None))
+        # Taste (test version): same corrections, plus why – see taste.py
+        m.add_separator()
+        m.add_command(label='Immer behalten – Geschmack', command=lambda: self._set_override(a, b, 'keep', True))
+        m.add_command(label='Immer rausschneiden – Geschmack', command=lambda: self._set_override(a, b, 'drop', True))
+        if own:
+            m.add_command(label='Festlegung hier als Geschmack markieren', command=lambda: self._mark_taste(a, b, True))
+        if any(t_a < b and t_b > a for t_a, t_b, _m in it.marks):
+            m.add_command(label='Geschmack-Markierung hier entfernen', command=lambda: self._mark_taste(a, b, False))
         if play_at is not None:
             m.add_separator()
             m.add_command(label=f'Ab {fmt_time(play_at)} abspielen', command=lambda: self._play(play_at))
@@ -1032,8 +1061,9 @@ class App:
             m.grab_release()
             self.root.after(150, lambda: self.canvas.delete('sel'))
 
-    def _set_override(self, a, b, mode):
-        """mode 'keep' / 'drop' adds a correction (newest wins), None removes corrections in [a, b)."""
+    def _set_override(self, a, b, mode, by_taste=False):
+        """mode 'keep' / 'drop' adds a correction (newest wins), None removes corrections in [a, b).
+        by_taste: made because of taste – marked as such (a new correction without it unmarks [a, b))."""
         it = self.current
         if it is None:
             return
@@ -1041,9 +1071,27 @@ class App:
         fs.save_overrides(it.path, it.overrides, decision=it.mode)
         # a reviewed cut of this mode follows too
         fs.correct_labels(it.path, a, b, mode, it.an['meta']['duration'], decision=it.mode)
+        marks = fs.set_override(it.marks, a, b, mode if by_taste else None)
+        self._save_marks(it, taste.prune(marks, it.overrides))
         self._recompute()
         what = {'keep': 'bleibt immer drin', 'drop': 'fliegt immer raus', None: 'wieder automatisch'}[mode]
-        self.status_var.set(f'{fmt_time(a)}–{fmt_time(b)} {what}')
+        self.status_var.set(f'{fmt_time(a)}–{fmt_time(b)} {what}' + (' (Geschmack)' if by_taste and mode else ''))
+
+    def _mark_taste(self, a, b, on):
+        """Mark the own corrections in [a, b) as made because of taste, or take the mark away."""
+        it = self.current
+        if it is None:
+            return
+        marks = taste.mark_corrections(it.marks, it.overrides, a, b) if on else taste.unmark(it.marks, a, b)
+        self._save_marks(it, marks)
+        self._recompute()
+        self.status_var.set(f'{fmt_time(a)}–{fmt_time(b)} ' + ('wegen Geschmack' if on else 'nicht mehr als Geschmack markiert'))
+
+    @staticmethod
+    def _save_marks(it, marks, decision=None):
+        decision = decision or it.mode
+        it.taste[fs.mode_of(decision)] = list(marks)
+        taste.save_marks(it.path, marks, decision=decision)
 
     def _clear_overrides(self):
         it = self.current
@@ -1051,6 +1099,7 @@ class App:
             return
         it.overrides = []
         fs.save_overrides(it.path, [], decision=it.mode)
+        self._save_marks(it, [])
         self._recompute()
         self.status_var.set('Alle eigenen Festlegungen entfernt – wieder alles automatisch')
 
@@ -1084,6 +1133,8 @@ class App:
             return
         st = it.res['stats']
         own = f" · {len(it.overrides)} selbst festgelegt" if it.overrides else ''
+        if it.marks:
+            own += f" ({fmt_time(sum(b - a for a, b, _m in it.marks))} wegen Geschmack)"
         cmp = ''
         if 'vs_classic' in it.res:
             new, gone = (sum(b - a for a, b in sp) for sp in it.res['vs_classic'])
@@ -1091,6 +1142,8 @@ class App:
         self.summary_var.set(f"Behalten: {fmt_time(st['kept_sec'])} von {fmt_time(st['duration'])} "
                              f"({st['share'] * 100:.0f} %) · {st['segments']} {'Szene' if st['segments'] == 1 else 'Szenen'}"
                              f"{own}{cmp}")
+        for w in self.taste_legend:
+            w.pack_forget()  # re-packed after the comparison legend, so the order stays
         for sq, lbl in self.cmp_legend:
             if 'vs_classic' in it.res:
                 sq.pack(side='left')
@@ -1098,6 +1151,9 @@ class App:
             else:
                 sq.pack_forget()
                 lbl.pack_forget()
+        if it.marks:
+            for w in self.taste_legend:
+                w.pack(side='left')
         lvl = it.res['motion_level']
         auto = ' (automatisch)' if self.s.motion_level < 0 else ''
         self.motion_hint.configure(text=f'aktivste {100 - lvl:.0f} % zählen als Action{auto}')
@@ -1132,6 +1188,7 @@ class App:
         try:
             it.an = fs.analyze(it.path, progress=prog, cancel=self.cancel)
             it.ov = {m: fs.load_overrides(it.path, decision=m) for m in fs.MODES}
+            it.taste = {m: taste.load_marks(it.path, decision=m) for m in fs.MODES}
             it.status = 'fertig'
         except fs.Cancelled:
             it.status = 'abgebrochen'
@@ -1239,6 +1296,8 @@ class App:
             ov = fs.set_override(ov, a, b, mode)
         it.ov[fs.mode_of(decision)] = ov
         fs.save_overrides(it.path, ov, decision=decision)
+        # Taste marks stay where the new edit decides the same way
+        self._save_marks(it, taste.prune(it.taste.get(fs.mode_of(decision), []), ov), decision)
         fs.save_labels(it.path, final, reviewed=answer, source='davinci', note=f'{project} / {timeline}',
                        decision=decision)
         if it is self.current:
