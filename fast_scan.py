@@ -53,6 +53,15 @@ AUDIO_GROUPS = {
 AUDIO_KEYS = ('speech', 'vocal', 'music', 'silence', 'loud')
 VIDEO_KEYS = ('diff', 'motion', 'luma')
 
+# Faces (test switch, only searched when it is on): YuNet (OpenCV model zoo, MIT) on small colour
+# frames. Faces don't come and go ten times a second, 2 frames per second are plenty; at 320×180
+# one frame takes ~5 ms on the CPU, so the detector keeps up with the decode. 640×360 took five
+# times as long and found a face in only 2 % more frames.
+FACE_FPS = 2.0
+FACE_W, FACE_H = 320, 180
+FACE_SCORE = 0.6  # detector confidence that counts as "face visible"
+FACE_WIN_S = 10.0  # the face share is averaged over this long
+
 
 class Cancelled(Exception):
     pass
@@ -79,38 +88,45 @@ def probe(video):
 
 # ---------- Picture ----------
 
-def iter_frames(video, hwaccel=True, cancel=None):
-    """Yield (H, W) uint8 frames at SAMPLE_FPS from one sequential decode."""
+def iter_frames(video, hwaccel=True, cancel=None, fps=SAMPLE_FPS, size=(W, H), pix='gray', letterbox=False):
+    """Yield uint8 frames (h, w), or (h, w, 3) for pix='bgr24', at fps from one sequential decode.
+    letterbox: keep the aspect ratio and pad with black instead of stretching."""
+    w, h = size
+    scale = f'scale={w}:{h}:flags=area'
+    if letterbox:
+        scale = f'scale={w}:{h}:force_original_aspect_ratio=decrease:flags=area,pad={w}:{h}:-1:-1'
+    ch = 3 if pix == 'bgr24' else 1
     cmd = ['ffmpeg', '-v', 'error', '-nostdin']
     if hwaccel:
         cmd += ['-hwaccel', 'cuda']
     cmd += ['-i', video, '-an', '-sn', '-dn',
-            '-vf', f'fps={SAMPLE_FPS},scale={W}:{H}:flags=area,format=gray',
-            '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+            '-vf', f'fps={fps},{scale},format={pix}',
+            '-f', 'rawvideo', '-pix_fmt', pix, '-']
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             creationflags=CREATE_NO_WINDOW)
     # Drain stderr so a chatty ffmpeg can't block on a full pipe
     err_lines = []
     t_err = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
     t_err.start()
-    size = W * H
+    nbytes = w * h * ch
+    shape = (h, w, ch) if ch > 1 else (h, w)
     n = 0
     try:
         while True:
             if cancel is not None and cancel.is_set():
                 proc.kill()
                 raise Cancelled()
-            buf = proc.stdout.read(size)
-            if len(buf) < size:
+            buf = proc.stdout.read(nbytes)
+            if len(buf) < nbytes:
                 break
             n += 1
-            yield np.frombuffer(buf, np.uint8).reshape(H, W)
+            yield np.frombuffer(buf, np.uint8).reshape(shape)
     finally:
         proc.stdout.close()
         proc.wait()
         t_err.join(timeout=2)
     if n == 0 and hwaccel:
-        yield from iter_frames(video, hwaccel=False, cancel=cancel)
+        yield from iter_frames(video, hwaccel=False, cancel=cancel, fps=fps, size=size, pix=pix, letterbox=letterbox)
     elif n == 0:
         err = b''.join(err_lines).decode(errors='replace').strip()
         raise RuntimeError('ffmpeg: ' + (err.splitlines()[-1] if err else f'exit {proc.returncode}'))
@@ -146,6 +162,57 @@ def extract_video_features(video, duration, progress=None, cancel=None):
             progress(min(1.0, i / SAMPLE_FPS / duration))
     return {'diff': np.asarray(diff, np.float32), 'motion': np.asarray(motion, np.float32),
             'luma': np.asarray(luma, np.float32)}
+
+
+# ---------- Faces ----------
+
+def extract_faces(video, duration, progress=None, cancel=None):
+    """Highest face score (0..1) per frame at FACE_FPS, 0 = no face found. Its own decode of the
+    picture: the analysis above does not need colour or this size."""
+    model = os.path.join(_module_dir(), 'yunet.onnx')
+    if not os.path.isfile(model):
+        raise RuntimeError(f'Face model missing: {model}')
+    det = cv2.FaceDetectorYN.create(model, '', (FACE_W, FACE_H), score_threshold=0.3, nms_threshold=0.3, top_k=20)
+    scores = []
+    for i, f in enumerate(iter_frames(video, cancel=cancel, fps=FACE_FPS, size=(FACE_W, FACE_H), pix='bgr24',
+                                      letterbox=True)):
+        _, faces = det.detect(f)
+        scores.append(float(faces[:, 14].max()) if faces is not None else 0.0)
+        if progress and i % 60 == 0 and duration > 0:
+            progress(min(1.0, i / FACE_FPS / duration))
+    return np.asarray(scores, np.float32)
+
+
+def load_faces(video, cache_dir=None, compute_missing=False, progress=None, cancel=None):
+    """Face scores per frame at FACE_FPS (see extract_faces) from the cache, or None.
+    compute_missing runs the face pass when there are none yet and caches them."""
+    video = os.path.abspath(video)
+    path = _side_path(video, 'faces.npz', cache_dir)
+    stamp = np.r_[_stamp(video), FACE_FPS, FACE_W, FACE_H]
+    if os.path.isfile(path):
+        try:
+            z = np.load(path)
+            if np.array_equal(z['stamp'], stamp):
+                return z['score'].astype(np.float32) / 100.0
+        except Exception:
+            pass
+    if not compute_missing:
+        return None
+    score = np.round(extract_faces(video, probe(video)[0], progress, cancel) * 100).astype(np.uint8)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, stamp=stamp, score=score)
+    except OSError as e:
+        print(f'Faces not written: {e}', flush=True)
+    return score.astype(np.float32) / 100.0  # the same values as from the cache
+
+
+def faces_on_grid(score, n):
+    """Face visible (1) or not (0) per frame on the SAMPLE_FPS grid, n frames long."""
+    if len(score) == 0:
+        return np.zeros(n, np.float32)
+    k = np.minimum((np.arange(n) * (FACE_FPS / SAMPLE_FPS)).astype(int), len(score) - 1)
+    return (np.asarray(score)[k] >= FACE_SCORE).astype(np.float32)
 
 
 # ---------- Sound ----------
@@ -403,6 +470,8 @@ class Settings:
     decision: str = 'classic'  # classic | extend: classic picks the scenes, then each grows to its action
     strictness: float = 50.0  # extend: 0 = grow far, 100 = grow little
     scene_gap_s: float = 30.0  # extend: how long the action may calm down inside one scene
+    face_keep: bool = False  # test switch: cut where a face is visible less than face_level % of the time
+    face_level: float = 30.0
 
     @classmethod
     def from_dict(cls, d):
@@ -892,6 +961,18 @@ def decide(an, s, overrides=None):
         segs = _to_segments(keep, cuts, s, duration)
         curves['region'] = rhythm_display(rhythm)
         region_line = float(rhythm_display(rthr))
+
+    # Faces (test switch, an['face'] from faces_on_grid): applied last, so it only takes away –
+    # neither mode picks or grows differently because of it. On 9 reviewed videos it made both
+    # modes worse (classic 87 → 85–86 %, combined 79 → 58–70 % right: what was cut had MORE faces,
+    # story and talk), so it stays an opt-in test.
+    face = an.get('face')
+    if face is not None and len(face) == n:
+        curves['face'] = rolling_mean(face, int(FACE_WIN_S * SAMPLE_FPS)) * 100.0
+        masks['face'] = hysteresis(curves['face'], s.face_level)
+        if s.face_keep:
+            keep = keep & masks['face']
+            segs = _to_segments(keep, cuts, s, duration)
 
     if overrides:
         segs = apply_overrides(segs, overrides, duration)

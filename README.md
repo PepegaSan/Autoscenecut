@@ -72,6 +72,12 @@ video's own settings. The app's own settings are in `scenecut_settings.json` nex
     *Strenge* sets how far scenes grow, *Pausen in einer Szene* how long the action may calm
     down inside one. In the timeline a yellow bar marks what the growing adds, the yellow
     line in *Bewegung* is the 30 s motion it follows.
+  - *nur mit Gesicht (Test)*, on top of either mode: cuts out where a face is visible in less
+    than *Gesicht-Anteil* (Feinschliff) of the time, averaged over 10 s. The first time it is
+    switched on for a video, faces are searched once (YuNet, `yunet.onnx`, 2 frames per second
+    at 320×180, about 1 s per minute of video) and cached (`*.faces.npz`); the *Gesicht* lane
+    shows them. On the reviewed videos so far it made both modes worse – faces are mostly
+    visible in the story and talk that gets cut – so it is off by default.
   - Then hysteresis, gap closing, minimum length, edges snapped to cuts, and the manual
     corrections on top.
 
@@ -106,6 +112,7 @@ python fast_scan.py VIDEO [--motion-level 60] [--speech remove|ignore|keep] [--e
 | `evaluate.py` | measures the decision against your corrections |
 | `taste.py` | taste marks on corrections (test version) |
 | `yamnet.onnx`, `yamnet_class_map.csv` | sound classification model |
+| `yunet.onnx` | face detector (YuNet from the OpenCV model zoo, MIT licence) |
 
 ## Tests
 

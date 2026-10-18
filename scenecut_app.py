@@ -32,7 +32,7 @@ C = {
     'text': '#e8eaf0', 'muted': '#8a90a2', 'accent': '#00c8ff', 'accent_dim': '#0a5f7a',
     'keep': '#3ccf7a', 'keep_bg': '#1f4d35', 'motion': '#00c8ff', 'motion_off': '#153646', 'vocal': '#ffb74d', 'speech': '#c792ea', 'music': '#7f8cff',
     'cut': '#4a5068', 'error': '#ff8a80', 'drop': '#5a2a2a', 'new': '#ffe066', 'gone': '#b0b6c8',
-    'taste': '#ff7eb6',
+    'taste': '#ff7eb6', 'face': '#80cbc4',
 }
 FONT = ('Segoe UI', 10)
 FONT_B = ('Segoe UI Semibold', 10)
@@ -49,8 +49,8 @@ PRESETS = {
                    'merge_gap_s': 8.0, 'pad_s': 1.0},
                   'Fast alles mit etwas Bewegung oder Stimme bleibt, nur klarer Dialog fliegt raus.'),
 }
-# Chosen separately from the presets: a preset never switches the decision mode
-MODE_KEYS = ('decision', 'strictness', 'scene_gap_s')
+# Chosen separately from the presets: a preset never switches the decision mode or the face test
+MODE_KEYS = ('decision', 'strictness', 'scene_gap_s', 'face_keep', 'face_level')
 
 
 def _app_dir():
@@ -111,6 +111,7 @@ class Item:
         self.ov = {}  # manual corrections per mode (fs.MODES): [(start, end, 'keep' | 'drop'), ...]
         self.taste = {}  # per mode: the corrections made because of taste (see taste.py)
         self.s = None  # own slider settings (fs.Settings), set when first shown
+        self.faces = None  # face search: None (not tried) | 'busy' | 'done' | 'stopped' (cancelled / failed)
 
     @property
     def mode(self):
@@ -469,6 +470,16 @@ class App:
         self.strict_scale = self._scale(card, 0, 'strictness', 0, 100, col=1, card=True)
         self.strict_hint = ttk.Label(card, text='', style='CardMuted.TLabel')
         self.strict_hint.grid(row=1, column=1, columnspan=2, sticky='w', padx=(12, 0))
+        self.v['face_keep'] = tk.BooleanVar()
+        cb = ttk.Checkbutton(card, text='nur mit Gesicht (Test)', variable=self.v['face_keep'],
+                             style='CardPlain.TCheckbutton', command=self._changed)
+        cb.grid(row=2, column=0, sticky='w', padx=(22, 0))
+        Tooltip(cb, 'Gilt zusätzlich zu klassisch / kombiniert: raus, wo zu selten ein Gesicht zu sehen ist '
+                    '(Anteil unter „Feinschliff“). Beim ersten Einschalten werden die Gesichter einmal gesucht '
+                    '(etwa 1 s pro Videominute). An deinen geprüften Videos hat es die Schnitte bisher '
+                    'verschlechtert – Gesichter sieht man vor allem in der Story.')
+        self.face_hint = ttk.Label(card, text='', style='CardMuted.TLabel')
+        self.face_hint.grid(row=2, column=1, columnspan=2, sticky='w', padx=(12, 0))
 
         # One card per category: title + options left, slider + its explanation right
         self.v['motion_keep'] = tk.BooleanVar()
@@ -525,6 +536,8 @@ class App:
                 ('smooth_s', 'Glättung', 0.5, 8, 's', 'Höher = ruhigere Entscheidung, weniger Zerstückelung.'),
                 ('scene_gap_s', 'Pausen in einer Szene', 5, 120, 's',
                  'Nur kombiniert: so lange darf die Action abflauen, ohne dass die Szene endet.'),
+                ('face_level', 'Gesicht-Anteil', 5, 95, '%',
+                 'Nur mit „nur mit Gesicht“: so viel der Zeit (je 10 s) muss ein Gesicht zu sehen sein.'),
         )):
             self.v[key] = tk.DoubleVar()
             card = self._card(fine, i)
@@ -613,7 +626,7 @@ class App:
         s = self.s
         for k in ('motion_keep', 'vocal_keep', 'music_keep', 'speech_mode', 'vocal_level', 'speech_level',
                   'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s', 'decision', 'strictness',
-                  'scene_gap_s'):
+                  'scene_gap_s', 'face_keep', 'face_level'):
             self.v[k].set(getattr(s, k))
         self.v['motion_auto'].set(s.motion_level < 0)
         self.v['motion_level'].set(s.motion_level if s.motion_level >= 0 else 50)
@@ -621,12 +634,12 @@ class App:
 
     def _read_widgets(self):
         s = self.s
-        for k in ('motion_keep', 'vocal_keep', 'music_keep'):
+        for k in ('motion_keep', 'vocal_keep', 'music_keep', 'face_keep'):
             setattr(s, k, bool(self.v[k].get()))
         s.speech_mode = self.v['speech_mode'].get()
         s.decision = self.v['decision'].get()
         for k in ('vocal_level', 'speech_level', 'music_level', 'min_len_s', 'merge_gap_s', 'pad_s', 'smooth_s',
-                  'strictness', 'scene_gap_s'):
+                  'strictness', 'scene_gap_s', 'face_level'):
             setattr(s, k, round(float(self.v[k].get()), 1))
         s.motion_level = -1.0 if self.v['motion_auto'].get() else round(float(self.v['motion_level'].get()), 1)
 
@@ -641,7 +654,10 @@ class App:
     def _changed(self):
         if self._loading:
             return
+        face_before = self.s.face_keep
         self._read_widgets()
+        if self.s.face_keep and not face_before and self.current is not None and self.current.faces == 'stopped':
+            self.current.faces = None  # switched on again: search again after a cancel or an error
         self._sync_motion_widgets()
         if self._redraw_after:
             self.root.after_cancel(self._redraw_after)
@@ -654,6 +670,10 @@ class App:
         if save_video and it is not None:
             fs.save_video_settings(it.path, self.s)
         if it is not None and it.an is not None:
+            if self.s.face_keep and 'face' not in it.an and it.faces is None:
+                it.faces = 'busy'
+                self.jobs.put(('faces', it))
+                self._update_buttons()
             it.res = fs.decide(it.an, self.s, it.overrides)
             if self.s.decision != 'classic':
                 # What changes against the classic decision: the places worth a look
@@ -782,7 +802,8 @@ class App:
     # light up where the category is detected (full colour) and stay faint where it is only weak.
     LABEL_W = 78
 
-    def _lanes(self, h):
+    def _lanes(self, h, face=False):
+        """face: one more strip above the sound ones, only for videos whose faces were searched."""
         axis = 22
         keep = (6, 30)
         sound_h, gap = 14, 4
@@ -790,8 +811,13 @@ class App:
         music = (music_b - sound_h, music_b)
         speech = (music[0] - gap - sound_h, music[0] - gap)
         vocal = (speech[0] - gap - sound_h, speech[0] - gap)
-        motion = (keep[1] + 8, vocal[0] - 8)
-        return {'keep': keep, 'motion': motion, 'vocal': vocal, 'speech': speech, 'music': music}, h - axis
+        lanes = {'keep': keep, 'vocal': vocal, 'speech': speech, 'music': music}
+        top = vocal[0]
+        if face:
+            lanes['face'] = (vocal[0] - gap - sound_h, vocal[0] - gap)
+            top = lanes['face'][0]
+        lanes['motion'] = (keep[1] + 8, top - 8)
+        return lanes, h - axis
 
     @staticmethod
     def _mix(color, amount, base):
@@ -816,7 +842,7 @@ class App:
         dur = res['stats']['duration'] or 1.0
         x0, x1 = self.LABEL_W, w - 10
         self._tl = (x0, x1, dur)
-        lanes, axis_y = self._lanes(h)
+        lanes, axis_y = self._lanes(h, face='face' in res['curves'])
         cols = max(2, int(x1 - x0))
         n = len(res['curves']['motion'])
         edges = np.linspace(0, n, cols + 1).astype(int)
@@ -904,16 +930,20 @@ class App:
             cv.create_line(x0, ly, x1, ly, fill=C['new'], dash=(2, 4))
         label('motion', 'Bewegung', on)
 
-        # Sound lanes
+        # Face and sound lanes
         modes = {'vocal': ('Stimme', s.vocal_keep), 'music': ('Musik', s.music_keep),
                  'speech': ({'remove': 'Sprache ✂', 'keep': 'Sprache', 'ignore': 'Sprache'}[s.speech_mode],
-                            s.speech_mode != 'ignore')}
-        for key in ('vocal', 'speech', 'music'):
+                            s.speech_mode != 'ignore'),
+                 'face': ('Gesicht', s.face_keep)}
+        for key in ('face', 'vocal', 'speech', 'music'):
+            if key not in lanes:
+                continue
             text, on = modes[key]
+            have = key == 'face' or has_audio
             y0, y1 = lanes[key]
             lane_bg(y0, y1)
-            label(key, text, on and has_audio)
-            if not has_audio:
+            label(key, text, on and have)
+            if not have:
                 continue
             vals = per_px(res['curves'][key], 'max') / 100.0
             hit = per_px(res['masks'][key].astype(np.float64), 'mean') > 0.3
@@ -974,6 +1004,8 @@ class App:
         if 'region' in c:
             txt += f"   Rhythmus {c['region'][i]:.0f}"
         txt += f"   Bewegung {c['motion'][i]:.0f}"
+        if 'face' in c:
+            txt += f"  Gesicht {c['face'][i]:.0f} %"
         if it.an['meta'].get('has_audio'):
             txt += f"  Stimme {c['vocal'][i]:.0f}  Sprache {c['speech'][i]:.0f}"
         h = self.canvas.winfo_height()
@@ -1127,6 +1159,7 @@ class App:
 
     def _update_summary(self):
         it = self.current
+        self._update_face_hint()
         if it is None or it.res is None:
             self.summary_var.set('')
             self.motion_hint.configure(text='')
@@ -1158,6 +1191,22 @@ class App:
         auto = ' (automatisch)' if self.s.motion_level < 0 else ''
         self.motion_hint.configure(text=f'aktivste {100 - lvl:.0f} % zählen als Action{auto}')
 
+    def _update_face_hint(self):
+        it = self.current
+        if it is None or it.an is None:
+            text = ''
+        elif 'face' in it.an:
+            text = (f"Gesicht in {it.an['face'].mean() * 100:.0f} % des Videos · "
+                    f'raus, wo je 10 s unter {self.s.face_level:.0f} %' if self.s.face_keep else
+                    f"Gesicht in {it.an['face'].mean() * 100:.0f} % des Videos (Spur „Gesicht“)")
+        elif it.faces == 'busy':
+            text = 'Gesichter werden gesucht …'
+        elif it.faces == 'stopped':
+            text = 'Gesichtersuche abgebrochen – Häkchen aus und wieder an = nochmal'
+        else:
+            text = 'zusätzlich: raus, wo zu selten ein Gesicht zu sehen ist'
+        self.face_hint.configure(text=text)
+
     # ---------- Worker ----------
 
     def _worker(self):
@@ -1171,6 +1220,8 @@ class App:
                     self._run_export(*job[1:])
                 elif kind == 'import':
                     self._run_import(job[1])
+                elif kind == 'faces':
+                    self._run_faces(job[1])
             except Exception as e:  # never kill the worker
                 self.events.put(('error', job, str(e)))
 
@@ -1186,7 +1237,9 @@ class App:
             it.status = f'analysiert {p * 100:.0f} %'
             self.events.put(('item', it))
         try:
-            it.an = fs.analyze(it.path, progress=prog, cancel=self.cancel)
+            an = fs.analyze(it.path, progress=prog, cancel=self.cancel)
+            self._attach_faces(it, an)  # only if already searched once (cache)
+            it.an = an
             it.ov = {m: fs.load_overrides(it.path, decision=m) for m in fs.MODES}
             it.taste = {m: taste.load_marks(it.path, decision=m) for m in fs.MODES}
             it.status = 'fertig'
@@ -1197,17 +1250,50 @@ class App:
             it.error = str(e)
         self.events.put(('item', it))
 
+    @staticmethod
+    def _attach_faces(it, an, progress=None, cancel=None):
+        """Faces into an['face'] from the cache; with progress also search them when missing.
+        True when they are there."""
+        if 'face' not in an:
+            score = fs.load_faces(it.path, compute_missing=progress is not None, progress=progress, cancel=cancel)
+            if score is None:
+                return False
+            an['face'] = fs.faces_on_grid(score, len(an['diff']))
+        it.faces = 'done'
+        return True
+
+    def _run_faces(self, it):
+        self.cancel.clear()
+        try:
+            self._attach_faces(it, it.an, cancel=self.cancel, progress=lambda p: self.events.put(
+                ('progress', p, f'{it.name}: Gesichter werden gesucht … {p * 100:.0f} %')))
+            msg = f"{it.name}: Gesicht in {it.an['face'].mean() * 100:.0f} % des Videos zu sehen"
+        except fs.Cancelled:
+            msg = f'{it.name}: Gesichtersuche abgebrochen'
+        finally:
+            if it.faces == 'busy':
+                it.faces = 'stopped'
+            self.events.put(('faces_done', it))
+        self.events.put(('status', msg))
+
     def _run_export(self, items, kind, out_dir, full_length=False, render_kbps=None):
         self.cancel.clear()
         written = []
         loaded = []
         for k, (it, settings) in enumerate(items, 1):
+            prefix = f'[{k}/{len(items)}] {it.name}: ' if len(items) > 1 else ''
+            if settings.face_keep and 'face' not in it.an:
+                try:
+                    self._attach_faces(it, it.an, cancel=self.cancel, progress=lambda p: self.events.put(
+                        ('progress', p, prefix + 'Gesichter werden gesucht …')))
+                except fs.Cancelled:
+                    self.events.put(('export_done', written, 'Export abgebrochen'))
+                    return
             res = fs.decide(it.an, settings, it.overrides_for(settings.decision))
             if not res['segments']:
                 self.events.put(('status', f'{it.name}: nichts zu behalten – übersprungen'))
                 continue
             dest = out_dir or os.path.dirname(it.path)
-            prefix = f'[{k}/{len(items)}] {it.name}: ' if len(items) > 1 else ''
             self.events.put(('progress', 0.0, prefix + 'Export läuft …'))
             try:
                 if kind == 'davinci':
@@ -1350,6 +1436,11 @@ class App:
                     self.busy_export = False
                     self._update_buttons()
                     self._apply_import(*ev[1:])
+                elif kind == 'faces_done':
+                    self.pbar['value'] = 1.0
+                    if ev[1] is self.current:
+                        self._recompute()
+                    self._update_buttons()
                 elif kind == 'error':
                     self.busy_export = False
                     self.status_var.set('Fehler: ' + ev[2])
@@ -1423,7 +1514,8 @@ class App:
     def _update_buttons(self):
         cur_ok = self.current is not None and self.current.an is not None
         any_ok = any(it.an is not None for it in self.items)
-        running = self.busy_export or any(it.status.startswith('analysiert') for it in self.items)
+        running = self.busy_export or any(it.status.startswith('analysiert') or it.faces == 'busy'
+                                          for it in self.items)
         self.btn_export.state(['!disabled'] if cur_ok and not self.busy_export else ['disabled'])
         self.btn_import.state(['!disabled'] if cur_ok and not self.busy_export else ['disabled'])
         self.btn_export_all.state(['!disabled'] if any_ok and not self.busy_export else ['disabled'])

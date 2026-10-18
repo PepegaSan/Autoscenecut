@@ -194,6 +194,34 @@ def test_extend_mode():
     assert fs.Settings.from_dict({'decision': 'score', 'block_s': 20}).decision == 'extend'
 
 
+def test_face_switch():
+    # Action the whole 300 s (rhythm and voice), a face only 100–200 s
+    an = _fake_analysis(300, motion_fn=lambda x: _beat(x, 0.05), vocal_fn=lambda x: 0.8, jitter=0.0)
+    base = dict(motion_keep=False, vocal_keep=True, speech_mode='ignore')
+    plain = fs.decide(an, fs.Settings(**base))['segments']
+    assert _overlap(plain, 0, 300) > 290, plain
+    # not searched yet: the switch changes nothing, no face lane
+    res = fs.decide(an, fs.Settings(**base, face_keep=True))
+    assert res['segments'] == plain and 'face' not in res['curves']
+    score = np.array([0.9 if 100 <= k / fs.FACE_FPS < 200 else 0.2 for k in range(int(300 * fs.FACE_FPS))])
+    an['face'] = fs.faces_on_grid(score, len(an['diff']))
+    res = fs.decide(an, fs.Settings(**base))
+    assert res['segments'] == plain and 'face' in res['curves'], 'switch off: curve only'
+    for decision in ('classic', 'extend'):
+        segs = fs.decide(an, fs.Settings(**base, decision=decision, face_keep=True))['segments']
+        assert _overlap(segs, 105, 195) > 89 and _overlap(segs, 0, 95) == 0 and _overlap(segs, 205, 300) == 0, segs
+    # manual corrections still win
+    segs = fs.decide(an, fs.Settings(**base, face_keep=True), [(10.0, 20.0, 'keep')])['segments']
+    assert _overlap(segs, 10, 20) == 10, segs
+
+
+def test_faces_on_grid():
+    g = fs.faces_on_grid(np.array([0.9, 0.1, 0.7]), 15)
+    step = int(fs.SAMPLE_FPS / fs.FACE_FPS)
+    assert g.tolist() == [1.0] * step + [0.0] * step + [1.0] * (15 - 2 * step), g.tolist()
+    assert fs.faces_on_grid(np.array([]), 4).tolist() == [0.0] * 4
+
+
 def test_override_helpers():
     ov = fs.set_override([(10.0, 20.0, 'drop')], 15.0, 30.0, 'keep')
     assert ov == [(10.0, 15.0, 'drop'), (15.0, 30.0, 'keep')], ov
@@ -327,6 +355,12 @@ def test_end_to_end(tmp_path: Path):
     assert emb is not None and emb[0].shape[1] == 1024 and abs(len(emb[0]) - 150 / 0.96) <= 2, emb[0].shape
     assert abs(emb[1][-1] - 150) < 2, emb[1][-1]
 
+    # Faces: only searched on request, then cached; the synthetic picture has none
+    assert fs.load_faces(str(vid), cache_dir=str(cache_dir)) is None
+    score = fs.load_faces(str(vid), cache_dir=str(cache_dir), compute_missing=True)
+    assert abs(len(score) - 150 * fs.FACE_FPS) <= 2 and score.max() < fs.FACE_SCORE, (len(score), score.max())
+    assert np.array_equal(fs.load_faces(str(vid), cache_dir=str(cache_dir)), score)
+
     # Exports
     xml = fs.export_davinci(str(vid), segs, an['meta']['fps'], str(tmp_path), 'xml')
     edl = fs.export_davinci(str(vid), segs, an['meta']['fps'], str(tmp_path), 'edl')
@@ -364,6 +398,8 @@ def main() -> int:
         test_decide_motion_vocal_speech,
         test_motion_rhythm,
         test_extend_mode,
+        test_face_switch,
+        test_faces_on_grid,
         test_override_helpers,
         test_labels_and_export_record,
         test_pool_embeddings,
