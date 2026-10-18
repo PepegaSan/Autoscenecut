@@ -1003,20 +1003,35 @@ def full_length_parts(segments, duration):
 
 # ---------- Export ----------
 
-def export_davinci(video, segs, fps, out_dir, kind='xml', full_length=False, duration=None):
+def clip_spans(segs, a, b, min_len=0.5):
+    """The parts of sorted (start, end) spans inside [a, b); slivers shorter than min_len go."""
+    out = [(max(s0, a), min(s1, b)) for s0, s1 in segs]
+    return [(s0, s1) for s0, s1 in out if s1 - s0 >= min_len]
+
+
+def span_tag(a, b):
+    """'12m05s-14m30s': a time range for file names (no ':' on Windows)."""
+    def t(x):
+        m, s = divmod(int(round(x)), 60)
+        return f'{m}m{s:02d}s'
+    return f'{t(a)}-{t(b)}'
+
+
+def export_davinci(video, segs, fps, out_dir, kind='xml', full_length=False, duration=None, suffix=None):
     """kind: xml (FCP7, DaVinci File → Import → Timeline) or edl. Returns the written path.
 
     full_length: the whole video, cut at every segment edge, clips at their source time.
+    suffix: end of the file name (default _scenecut, _scenecut_full).
     """
     from timeline_export import export_edl_cmx, export_xml_xmeml
     base = os.path.splitext(os.path.basename(video))[0]
-    suffix = '_scenecut_full' if full_length else '_scenecut'
+    suffix = suffix or ('_scenecut_full' if full_length else '_scenecut')
     if full_length:
         segs = [(a, b) for a, b, _keep in full_length_parts(segs, duration if duration else probe(video)[0])]
     if kind == 'edl':
-        export_edl_cmx(video, segs, fps, out_dir, at_source_time=full_length)
+        export_edl_cmx(video, segs, fps, out_dir, at_source_time=full_length, suffix=suffix)
         return os.path.join(out_dir, f'{base}{suffix}.edl')
-    export_xml_xmeml(video, segs, fps, out_dir, at_source_time=full_length)
+    export_xml_xmeml(video, segs, fps, out_dir, at_source_time=full_length, suffix=suffix)
     return os.path.join(out_dir, f'{base}{suffix}.xml')
 
 
@@ -1027,11 +1042,11 @@ def _nvenc_ok():
     return r.returncode == 0
 
 
-def export_mp4(video, segs, out_dir, progress=None, cancel=None):
+def export_mp4(video, segs, out_dir, progress=None, cancel=None, suffix='_scenecut'):
     """Re-encode every segment frame-accurately (NVENC HEVC, otherwise x264), then join them."""
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(video))[0]
-    final = os.path.join(out_dir, f'{base}_scenecut.mp4')
+    final = os.path.join(out_dir, f'{base}{suffix}.mp4')
     venc = ['-c:v', 'hevc_nvenc', '-preset', 'p4', '-cq', '23'] if _nvenc_ok() else \
         ['-c:v', 'libx264', '-preset', 'medium', '-crf', '20']
     tmp_dir = os.path.join(out_dir, f'.{base}_parts')

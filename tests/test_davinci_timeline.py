@@ -174,8 +174,9 @@ def _patch(project, resolve, fps=29.97002997002997, wh=(1280, 720)):
     dt.probe_video_wh = lambda path: wh
     project.render_calls = []
 
-    def fake_prepare(_resolve, proj, path, kbps, target_dir, w, h):
+    def fake_prepare(_resolve, proj, path, kbps, target_dir, w, h, name=None):
         proj.render_calls.append((path, kbps, target_dir, w, h))
+        proj.render_name = name
         return f'Scenecut H264 {kbps or 1000}k', kbps or 1000
     dt.prepare_render = fake_prepare
 
@@ -261,6 +262,18 @@ def test_deliver_setup(tmp_path: Path):
     assert project.render_calls == [], 'deliver=False must leave the Deliver page alone'
 
 
+def test_excerpt(tmp_path: Path):
+    vid = _video(tmp_path)
+    project, resolve = FakeProject('Edit'), FakeResolve()
+    _patch(project, resolve)
+    _proj, name, n = dt.load_into_timeline(str(vid), [(725.0, 790.0), (800.0, 870.4)], log=lambda m: None,
+                                           excerpt=(725.0, 870.4))
+    assert name == 'My Clip – Ausschnitt 12m05s-14m30s' and n == 2, (name, n)
+    assert project.render_name == 'My Clip_scenecut_12m05s-14m30s', 'render must not overwrite the whole cut'
+    _proj, name, _n = dt.load_into_timeline(str(vid), [(0.0, 5.0)], log=lambda m: None)
+    assert name == 'My Clip – Scenecut' and project.render_name is None, (name, project.render_name)
+
+
 class EditedItem:
     """Timeline item as the user left it in Resolve."""
     def __init__(self, clip, src_start, frames, color='', enabled=True, start_getter=True):
@@ -329,6 +342,11 @@ def test_read_back(tmp_path: Path):
     assert dt.find_timeline(project, str(vid)) is tl
     project.GetCurrentTimeline = lambda: project.timelines[1]
     assert dt.find_timeline(project, str(vid)) is project.timelines[1]
+    # An open excerpt timeline is not the cut of the whole video
+    excerpt = EditedTimeline('My Clip – Ausschnitt 12m05s-14m30s', [[EditedItem(mine, 0, 10)]])
+    project.GetCurrentTimeline = lambda: excerpt
+    assert dt.find_timeline(project, str(vid)) is tl
+    project.GetCurrentTimeline = lambda: project.timelines[1]
 
     # Through read_timeline_cut: read only, Resolve must not be started for it
     calls = []
@@ -362,7 +380,7 @@ def test_no_segments(tmp_path: Path):
 def main() -> int:
     import shutil
     tests = [test_empty_project, test_existing_project_reuses_clip_and_keeps_timelines, test_full_length,
-             test_deliver_setup, test_read_back, test_no_segments]
+             test_deliver_setup, test_excerpt, test_read_back, test_no_segments]
     work = _ROOT / 'output' / '_davinci_timeline_test'
     failed = 0
     for fn in tests:

@@ -127,16 +127,17 @@ def use_bitrate_preset(resolve, project, kbps, audio_kbps=AUDIO_KBPS):
     return name
 
 
-def prepare_render(resolve, project, video_path, kbps=None, target_dir=None, width=None, height=None):
-    """Deliver page ready for the current timeline: bitrate preset, target folder, file name,
-    resolution. kbps=None: derived from the source. Returns (preset name, kbps)."""
+def prepare_render(resolve, project, video_path, kbps=None, target_dir=None, width=None, height=None, name=None):
+    """Deliver page ready for the current timeline: bitrate preset, target folder, file name
+    (name, default <video>_scenecut), resolution. kbps=None: derived from the source.
+    Returns (preset name, kbps)."""
     kbps = kbps or auto_kbps(video_path)
     if not kbps:
         raise ResolveError('Bitrate der Quelle unbekannt – bitte eine Bitrate eintragen.')
     preset = use_bitrate_preset(resolve, project, int(kbps))
     stem = os.path.splitext(os.path.basename(video_path))[0]
     settings = {'SelectAllFrames': True, 'TargetDir': to_forward(target_dir or os.path.dirname(video_path)),
-                'CustomName': f'{stem}_scenecut'}
+                'CustomName': name or f'{stem}_scenecut'}
     if width and height:
         settings.update(FormatWidth=int(width), FormatHeight=int(height))
     if not project.SetRenderSettings(settings):

@@ -51,6 +51,11 @@ Manual alternative: `pip install -r requirements.txt`, then `python scenecut_app
    - finished MP4
    - Timeline content: only the kept parts, or the whole video cut at every scene edge
      (direct load colours kept parts green, the rest orange)
+   - **One scene or range only**: right-click a scene (or drag over a range) → *Nur diesen
+     Bereich …* exports just the kept parts in it, with the export chosen on the left. Files,
+     timeline and render are named after the range (`…_scenecut_12m05s-14m30s.mp4`,
+     *… – Ausschnitt 12m05s-14m30s*), so the export of the whole video is not overwritten.
+     Such an excerpt is never read back as the cut of the whole video.
 
 Every video remembers its own sliders (a video opened for the first time starts with those of the
 video shown before); *Auf alle Videos anwenden* copies them to the whole list. Export uses each

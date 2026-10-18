@@ -1080,6 +1080,15 @@ class App:
             m.add_command(label='Festlegung hier als Geschmack markieren', command=lambda: self._mark_taste(a, b, True))
         if any(t_a < b and t_b > a for t_a, t_b, _m in it.marks):
             m.add_command(label='Geschmack-Markierung hier entfernen', command=lambda: self._mark_taste(a, b, False))
+        # Only what stays in this range, with the export chosen on the left
+        part = fs.clip_spans(it.res['segments'], a, b)
+        how = {'davinci': 'in DaVinci laden', 'xml': 'als XML exportieren', 'edl': 'als EDL exportieren',
+               'mp4': 'als MP4 rendern'}[self.export_kind.get()]
+        m.add_separator()
+        m.add_command(label=f'Nur diesen Bereich {how} ({fmt_time(sum(e - s for s, e in part))} behalten)'
+                      if part else 'Nur diesen Bereich exportieren (hier bleibt nichts)',
+                      state='normal' if part and not self.busy_export else 'disabled',
+                      command=lambda: self.start_export(all_items=False, span=(a, b)))
         if play_at is not None:
             m.add_separator()
             m.add_command(label=f'Ab {fmt_time(play_at)} abspielen', command=lambda: self._play(play_at))
@@ -1276,10 +1285,14 @@ class App:
             self.events.put(('faces_done', it))
         self.events.put(('status', msg))
 
-    def _run_export(self, items, kind, out_dir, full_length=False, render_kbps=None):
+    def _run_export(self, items, kind, out_dir, full_length=False, render_kbps=None, span=None):
+        """span=(start, end): only the kept parts in that range of the (one) video – always just the
+        kept parts, named after the range, and no export record: reading back stays with the whole cut."""
         self.cancel.clear()
         written = []
         loaded = []
+        if span is not None:
+            full_length = False
         for k, (it, settings) in enumerate(items, 1):
             prefix = f'[{k}/{len(items)}] {it.name}: ' if len(items) > 1 else ''
             if settings.face_keep and 'face' not in it.an:
@@ -1289,33 +1302,40 @@ class App:
                 except fs.Cancelled:
                     self.events.put(('export_done', written, 'Export abgebrochen'))
                     return
-            res = fs.decide(it.an, settings, it.overrides_for(settings.decision))
-            if not res['segments']:
+            segs = fs.decide(it.an, settings, it.overrides_for(settings.decision))['segments']
+            if span is not None:
+                segs = fs.clip_spans(segs, *span)
+            if not segs:
                 self.events.put(('status', f'{it.name}: nichts zu behalten – übersprungen'))
                 continue
+            excerpt = (segs[0][0], segs[-1][1]) if span is not None else None
+            suffix = f'_scenecut_{fs.span_tag(*excerpt)}' if excerpt else None
             dest = out_dir or os.path.dirname(it.path)
             self.events.put(('progress', 0.0, prefix + 'Export läuft …'))
             try:
                 if kind == 'davinci':
                     from davinci_timeline import load_into_timeline  # Resolve API only when needed
                     _proj, tl, _n = load_into_timeline(
-                        it.path, res['segments'], log=lambda m: self.events.put(('status', prefix + m)),
+                        it.path, segs, log=lambda m: self.events.put(('status', prefix + m)),
                         full_length=full_length, duration=it.an['meta']['duration'],
-                        deliver=render_kbps != 0, render_kbps=render_kbps, render_dir=out_dir or None)
+                        deliver=render_kbps != 0, render_kbps=render_kbps, render_dir=out_dir or None,
+                        excerpt=excerpt)
                     loaded.append(tl)
-                    fs.save_export_record(it.path, res['segments'], full_length, target=f'DaVinci: {tl}',
-                                          decision=settings.decision)
+                    if not excerpt:
+                        fs.save_export_record(it.path, segs, full_length, target=f'DaVinci: {tl}',
+                                              decision=settings.decision)
                     self.events.put(('progress', k / len(items), prefix + f'In DaVinci geladen: {tl}'))
                     continue
                 if kind == 'mp4':
-                    path = fs.export_mp4(it.path, res['segments'], dest, cancel=self.cancel,
+                    path = fs.export_mp4(it.path, segs, dest, cancel=self.cancel, suffix=suffix or '_scenecut',
                                          progress=lambda p, t: self.events.put(('progress', p, prefix + t)))
                 else:
-                    path = fs.export_davinci(it.path, res['segments'], it.an['meta']['fps'], dest, kind,
-                                             full_length=full_length, duration=it.an['meta']['duration'])
+                    path = fs.export_davinci(it.path, segs, it.an['meta']['fps'], dest, kind,
+                                             full_length=full_length, duration=it.an['meta']['duration'],
+                                             suffix=suffix)
                     # Reference for reading the edit back once the file is imported into Resolve
-                    fs.save_export_record(it.path, res['segments'], full_length, target=path,
-                                          decision=settings.decision)
+                    if not excerpt:
+                        fs.save_export_record(it.path, segs, full_length, target=path, decision=settings.decision)
             except fs.Cancelled:
                 self.events.put(('export_done', written, 'Export abgebrochen'))
                 return
@@ -1479,10 +1499,11 @@ class App:
         if d:
             self._set_out(os.path.abspath(d))
 
-    def start_export(self, all_items):
+    def start_export(self, all_items, span=None):
+        """span=(start, end): only that range of the selected video (see _run_export)."""
         items = [it for it in self.items if it.an is not None] if all_items else \
             ([self.current] if self.current is not None and self.current.an is not None else [])
-        if not items:
+        if not items or self.busy_export:
             return
         # Bitrate for DaVinci's Deliver page: None = from the source, 0 = leave Deliver alone
         val = self.render_kbps.get().strip().lower()
@@ -1501,7 +1522,7 @@ class App:
         # Every video with its own sliders (snapshot: the sliders may move while exporting)
         items = [(it, fs.Settings.from_dict(self._settings_of(it).to_dict())) for it in items]
         self.jobs.put(('export', items, self.export_kind.get(), self.out_dir.get(), self.timeline_mode.get() == 'full',
-                       kbps))
+                       kbps, span))
 
     def cancel_current(self):
         self.cancel.set()

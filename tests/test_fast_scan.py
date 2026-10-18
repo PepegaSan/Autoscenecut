@@ -222,6 +222,14 @@ def test_faces_on_grid():
     assert fs.faces_on_grid(np.array([]), 4).tolist() == [0.0] * 4
 
 
+def test_excerpt_helpers():
+    segs = [(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)]
+    assert fs.clip_spans(segs, 15.0, 55.0) == [(15.0, 20.0), (30.0, 40.0), (50.0, 55.0)]
+    assert fs.clip_spans(segs, 19.8, 30.2) == [], 'slivers at the edges go'
+    assert fs.clip_spans(segs, 30.0, 40.0) == [(30.0, 40.0)]
+    assert fs.span_tag(725.0, 870.4) == '12m05s-14m30s' and fs.span_tag(3725, 3790) == '62m05s-63m10s'
+
+
 def test_override_helpers():
     ov = fs.set_override([(10.0, 20.0, 'drop')], 15.0, 30.0, 'keep')
     assert ov == [(10.0, 15.0, 'drop'), (15.0, 30.0, 'keep')], ov
@@ -369,7 +377,10 @@ def test_end_to_end(tmp_path: Path):
                              duration=an['meta']['duration'])
     events = [ln for ln in Path(full).read_text(encoding='utf-8').splitlines() if ln[:3].isdigit()]
     assert full.endswith('_scenecut_full.edl') and len(events) == 3, events  # before / kept / after
-    mp4 = fs.export_mp4(str(vid), [(40.0, 50.0), (60.0, 65.0)], str(tmp_path))
+    part = fs.export_davinci(str(vid), segs[:1], an['meta']['fps'], str(tmp_path), 'xml', suffix='_scenecut_0m40s-1m20s')
+    assert part.endswith('synthetic_scenecut_0m40s-1m20s.xml') and Path(part).is_file(), part
+    mp4 = fs.export_mp4(str(vid), [(40.0, 50.0), (60.0, 65.0)], str(tmp_path), suffix='_scenecut_0m40s-1m05s')
+    assert mp4.endswith('synthetic_scenecut_0m40s-1m05s.mp4'), mp4
     out = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', mp4],
                          capture_output=True, text=True)
     dur = float(json.loads(out.stdout)['format']['duration'])
@@ -400,6 +411,7 @@ def main() -> int:
         test_extend_mode,
         test_face_switch,
         test_faces_on_grid,
+        test_excerpt_helpers,
         test_override_helpers,
         test_labels_and_export_record,
         test_pool_embeddings,

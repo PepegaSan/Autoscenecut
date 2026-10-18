@@ -13,7 +13,7 @@ import os
 import time
 
 from davinci_render import prepare_render
-from fast_scan import full_length_parts
+from fast_scan import full_length_parts, span_tag
 
 from davinci_api import (
     ResolveError,
@@ -163,12 +163,19 @@ def timeline_cut(timeline, video_path, fps):
     return [(round(a, 3), round(b, 3)) for a, b in merged], found
 
 
+EXCERPT = 'Ausschnitt'  # timelines of one exported range: never read back as the cut of the whole video
+
+
+def _is_excerpt(timeline):
+    return f' – {EXCERPT} ' in (timeline.GetName() or '')
+
+
 def find_timeline(project, video_path):
     """The current timeline if it contains this video, otherwise the newest Scenecut timeline of
-    it (by name). None if there is none."""
+    it (by name). Excerpt timelines don't count. None if there is none."""
     want = _norm(video_path)
     cur = project.GetCurrentTimeline()
-    if cur is not None and next(_video_items(cur, want), None) is not None:
+    if cur is not None and not _is_excerpt(cur) and next(_video_items(cur, want), None) is not None:
         return cur
     stem = os.path.splitext(os.path.basename(video_path))[0]
     found = None
@@ -198,12 +205,14 @@ def read_timeline_cut(video_path, log=print):
 
 
 def load_into_timeline(video_path, segments, log=print, timeline_name=None, full_length=False, duration=None,
-                       deliver=True, render_kbps=None, render_dir=None):
+                       deliver=True, render_kbps=None, render_dir=None, excerpt=None):
     """Create a timeline from the keep-segments (seconds, source time).
 
     full_length=False: only the segments, back to back.
     full_length=True: the whole video (duration in seconds, default: clip length), cut at every
     segment edge, kept parts green, the rest orange.
+    excerpt=(start, end): the segments are one range of the video – timeline and render file are
+    named after it ("<video> – Ausschnitt 12m05s-14m30s"), and reading the cut back skips it.
     deliver=True also sets up the Deliver page: H.264 limited to render_kbps (None = derived from
     the source), into render_dir (default: next to the video). Nothing is queued or rendered.
     Call from any thread. Returns (project name, timeline name, number of clips).
@@ -241,7 +250,9 @@ def load_into_timeline(video_path, segments, log=print, timeline_name=None, full
             override_clip_fps(clip, fps, rate)
 
         stem = os.path.splitext(os.path.basename(video_path))[0]
-        base = timeline_name or (f'{stem} – Scenecut (ganzes Video)' if full_length else f'{stem} – Scenecut')
+        tag = span_tag(*excerpt) if excerpt else ''
+        base = timeline_name or (f'{stem} – {EXCERPT} {tag}' if excerpt else
+                                 f'{stem} – Scenecut (ganzes Video)' if full_length else f'{stem} – Scenecut')
         name = unique_name(base, timeline_names(project))
         timeline = media_pool.CreateEmptyTimeline(name)
         if timeline is None:
@@ -284,7 +295,8 @@ def load_into_timeline(video_path, segments, log=print, timeline_name=None, full
         project.SetCurrentTimeline(timeline)
         if deliver:
             try:
-                preset, kbps = prepare_render(resolve, project, video_path, render_kbps, render_dir, width, height)
+                preset, kbps = prepare_render(resolve, project, video_path, render_kbps, render_dir, width, height,
+                                              f'{stem}_scenecut_{tag}' if excerpt else None)
                 log(f'Deliver vorbereitet: {preset} (Video max. {kbps} kbit/s, Audio 128 kbit/s).')
             except Exception as e:  # the timeline is what counts
                 log(f'Hinweis: Render-Einstellungen nicht gesetzt – {e}')

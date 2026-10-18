@@ -145,6 +145,8 @@ def test_prepare_render(_tmp):
     s = project.render_settings
     assert s['TargetDir'] == 'D:/Videos' and s['CustomName'] == 'My Clip_scenecut', s
     assert (s['FormatWidth'], s['FormatHeight']) == (852, 478) and s['SelectAllFrames'] is True
+    dr.prepare_render(resolve, project, r'D:\Videos\My Clip.mp4', 700, None, None, None, 'My Clip_scenecut_1m00s-2m00s')
+    assert project.render_settings['CustomName'] == 'My Clip_scenecut_1m00s-2m00s', project.render_settings
 
 
 def main() -> int:

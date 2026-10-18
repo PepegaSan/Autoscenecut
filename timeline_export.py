@@ -71,14 +71,15 @@ def _frames_to_tc(total_frames, timebase):
     return f'{h:02d}:{m:02d}:{s:02d}:{ff:02d}'
 
 
-def export_xml_xmeml(vid, segs, fps, out_dir, *, at_source_time=False):
-    """Final Cut Pro 7 XML (xmeml) — DaVinci Resolve: File → Import → Timeline."""
+def export_xml_xmeml(vid, segs, fps, out_dir, *, at_source_time=False, suffix=None):
+    """Final Cut Pro 7 XML (xmeml) — DaVinci Resolve: File → Import → Timeline.
+    suffix: end of the file name (default _scenecut, or _scenecut_full at source time)."""
     if not segs:
         return False
     os.makedirs(out_dir, exist_ok=True)
     abs_vid = os.path.abspath(vid)
     base_name = os.path.splitext(os.path.basename(abs_vid))[0]
-    xml_name = f'{base_name}_scenecut_full.xml' if at_source_time else f'{base_name}_scenecut.xml'
+    xml_name = base_name + (suffix or ('_scenecut_full' if at_source_time else '_scenecut')) + '.xml'
     xml_path = os.path.join(out_dir, xml_name)
     pathurl = Path(abs_vid).as_uri()
     w, h = _video_w_h(abs_vid)
@@ -161,14 +162,14 @@ def export_xml_xmeml(vid, segs, fps, out_dir, *, at_source_time=False):
     return True
 
 
-def export_edl_cmx(vid, segs, fps, out_dir, *, at_source_time=False):
-    """CMX-style EDL; comments carry full source path for Resolve."""
+def export_edl_cmx(vid, segs, fps, out_dir, *, at_source_time=False, suffix=None):
+    """CMX-style EDL; comments carry full source path for Resolve. suffix: as export_xml_xmeml."""
     if not segs:
         return False
     os.makedirs(out_dir, exist_ok=True)
     abs_vid = os.path.abspath(vid)
     base_name = os.path.splitext(os.path.basename(abs_vid))[0]
-    edl_name = f'{base_name}_scenecut_full.edl' if at_source_time else f'{base_name}_scenecut.edl'
+    edl_name = base_name + (suffix or ('_scenecut_full' if at_source_time else '_scenecut')) + '.edl'
     edl_path = os.path.join(out_dir, edl_name)
     tb, _ = _xml_rate_tags(fps)
     ntsc = abs(float(fps) - 29.97002997002997) < 0.05 or abs(float(fps) - 59.94005994005994) < 0.05
